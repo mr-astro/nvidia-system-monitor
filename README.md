@@ -1,4 +1,4 @@
-# NVIDIA System Monitor for Fedora
+# NVIDIA System Monitor for LINUX
 
 Monitor de escritorio GTK4 para Fedora Linux: GPU NVIDIA, CPU, RAM, almacenamiento y sensores.
 
@@ -28,6 +28,10 @@ Los datos ausentes se muestran como `N/D`; nunca se sustituyen por valores inven
 ```bash
 sudo dnf install gtk4 python3-gobject
 ```
+
+### Otras distribuciones
+- **Ubuntu / Debian**: `sudo apt install gtk4 python3-gobject gir1.2-gtk-4.0 gir1.2-adw-1`
+- **Arch Linux / Manjaro**: `sudo pacman -S gtk4 python-gobject libadwaita`
 
 Opcionales:
 
