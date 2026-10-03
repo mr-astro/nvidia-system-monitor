@@ -30,8 +30,15 @@ sudo dnf install gtk4 python3-gobject
 ```
 
 ### Otras distribuciones
-- **Ubuntu / Debian**: `sudo apt install gtk4 python3-gobject gir1.2-gtk-4.0 gir1.2-adw-1`
-- **Arch Linux / Manjaro**: `sudo pacman -S gtk4 python-gobject libadwaita`
+
+- **Ubuntu / Debian**: 
+```bash 
+sudo apt install gtk4 python3-gobject gir1.2-gtk-4.0 gir1.2-adw-1
+```
+- **Arch Linux / Manjaro**: 
+```bash
+sudo pacman -S gtk4 python-gobject libadwaita
+```
 
 Opcionales:
 
