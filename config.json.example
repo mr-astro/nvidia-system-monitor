@@ -1,0 +1,24 @@
+{
+  "refresh_interval_seconds": 1.0,
+  "temperature_unit": "C",
+  "logging_enabled": true,
+
+  "panels": {
+    "cpu": true,
+    "gpu": true,
+    "ram": true,
+    "storage": true,
+    "sensors": true
+  },
+
+  "color_scheme": {
+    "low_usage_color": "#4CAF50",
+    "medium_usage_color": "#FFC107",
+    "high_usage_color": "#F44336"
+  },
+
+  "thresholds": {
+    "medium_percent": 60,
+    "high_percent": 85
+  }
+}

@@ -1,0 +1,8 @@
+# No third-party Python packages are required.
+# Fedora system packages required:
+#   gtk4
+#   python3-gobject
+#
+# Optional:
+#   lm_sensors      (panel de sensores)
+#   smartmontools   (temperatura SATA; normalmente requiere root)

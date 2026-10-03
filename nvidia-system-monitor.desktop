@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=NVIDIA System Monitor
+Comment=Monitor de hardware para Fedora Linux
+Exec=python3 %k/bin/system_monitor.py
+Terminal=false
+Categories=System;Monitor;

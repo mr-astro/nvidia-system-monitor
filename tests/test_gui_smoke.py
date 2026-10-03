@@ -1,0 +1,123 @@
+"""Builds the real GTK widgets. Skipped when GTK 4 or a display is unavailable."""
+import tempfile
+import unittest
+from pathlib import Path
+
+try:
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, Gtk
+
+    HAVE_GTK = bool(Gtk.init_check()) and Gdk.Display.get_default() is not None
+except (ImportError, ValueError):
+    HAVE_GTK = False
+
+from src.data.collector import Snapshot
+from src.data.cpu import CpuMetrics
+from src.data.nvidia import GpuMetrics
+from src.data.ram import RamMetrics
+from src.data.sensors import SensorReading
+from src.data.storage import DiskMetrics, PartitionMetrics
+
+
+def full_snapshot(n_gpus=1):
+    return Snapshot(
+        sequence=1, timestamp=0.0, gpu_available=True, cuda_version="12.6",
+        cpu=CpuMetrics(model="AMD Ryzen", usage_percent=42.0, cores=8, threads=16,
+                       frequency_mhz=3800.0, max_frequency_mhz=4700.0, temperature_c=55.0,
+                       load_1m=0.5, load_5m=0.4, load_15m=0.3),
+        gpus=[GpuMetrics(index=i, name=f"RTX {i}", utilization_percent=90.0,
+                         memory_total_mb=24576, memory_used_mb=20000, temperature_c=70.0,
+                         power_draw_w=300.0, power_limit_w=350.0, driver_version="560")
+              for i in range(n_gpus)],
+        ram=RamMetrics(total_mb=16000, used_mb=8000, available_mb=8000, free_mb=2000,
+                       cached_mb=6000, usage_percent=50.0, swap_total_mb=4096,
+                       swap_used_mb=100, swap_usage_percent=2.4),
+        disks=[DiskMetrics(name="nvme0n1", kind="NVMe", size_bytes=10 ** 12, temperature_c=38.0,
+                           partitions=[PartitionMetrics(
+                               name="nvme0n1p2", size_bytes=10 ** 12, fstype="btrfs",
+                               mountpoints=["/", "/home"], used_bytes=6 * 10 ** 11,
+                               free_bytes=3 * 10 ** 11, usage_percent=66.7)])],
+        sensors=[SensorReading("k10temp-pci-00c3", "Tctl", 45.25)],
+    )
+
+
+@unittest.skipUnless(HAVE_GTK, "GTK 4 o pantalla no disponibles")
+class GuiSmoke(unittest.TestCase):
+    def _app(self, **overrides):
+        from src.gui.app import SystemMonitorApp
+        from src.utils.config import Config
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.json"
+        import json
+        path.write_text(json.dumps({"logging_enabled": False, **overrides}))
+        app = SystemMonitorApp(Config(path))
+        app.register(None)  # emits "startup", as in a real launch
+        app._install_css()
+        app._build_window()
+        return app
+
+    def test_render_all_panels_twice_updates_in_place(self):
+        app = self._app()
+        app._render(full_snapshot())
+        rows_after_first = {n: dict(c._rows) for n, c in app.cards.items()}
+        app._render(full_snapshot())
+        for name, card in app.cards.items():
+            # same widgets reused: nothing was destroyed and rebuilt
+            self.assertEqual(set(card._rows), set(rows_after_first[name]))
+            for key, widgets in card._rows.items():
+                self.assertIs(widgets[1], rows_after_first[name][key][1])
+        self.assertEqual(app._last_render_error, {})
+
+    def test_values_are_rendered(self):
+        app = self._app()
+        app._render(full_snapshot())
+        self.assertEqual(app.cards["cpu"]._rows["usage"][1].get_label(), "42.0%")
+        self.assertEqual(app.cards["cpu"]._rows["temp"][1].get_label(), "55.0 °C")
+        self.assertIn("19.5 GiB", app.cards["gpu"]._rows["gpu0:vram"][1].get_label())
+
+    def test_usage_bar_gets_level_class(self):
+        app = self._app()
+        app._render(full_snapshot())
+        bar = app.cards["gpu"]._rows["gpu0:usage"][2]  # 90 % -> high
+        self.assertTrue(bar.has_css_class("usage-high"))
+        cpu_bar = app.cards["cpu"]._rows["usage"][2]    # 42 % -> low
+        self.assertTrue(cpu_bar.has_css_class("usage-low"))
+
+    def test_fahrenheit(self):
+        app = self._app(temperature_unit="F")
+        app._render(full_snapshot())
+        self.assertEqual(app.cards["cpu"]._rows["temp"][1].get_label(), "131.0 °F")
+
+    def test_disabled_panels_are_not_built(self):
+        app = self._app(panels={"gpu": False, "sensors": False})
+        self.assertEqual(set(app.cards), {"cpu", "ram", "storage"})
+        self.assertIsNone(app.collector.gpu)
+        app._render(full_snapshot())
+
+    def test_missing_data_shows_state_instead_of_crashing(self):
+        app = self._app()
+        app._render(Snapshot(sequence=1, gpu_available=False))
+        self.assertEqual(app.cards["gpu"]._rows["state"][1].get_label(), "nvidia-smi no disponible")
+        self.assertEqual(app.cards["cpu"]._rows["state"][1].get_label(), "Sin datos")
+        self.assertEqual(app._last_render_error, {})
+
+    def test_gpu_panel_recovers_when_gpu_appears(self):
+        app = self._app()
+        app._render(Snapshot(sequence=1, gpu_available=True))
+        app._render(full_snapshot())
+        self.assertIn("gpu0:name", app.cards["gpu"]._rows)
+
+    def test_multi_gpu(self):
+        app = self._app()
+        app._render(full_snapshot(n_gpus=2))
+        self.assertIn("gpu1:name", app.cards["gpu"]._rows)
+        self.assertTrue(app.cards["gpu"]._rows["gpu1:name"][0].get_label().startswith("GPU 1"))
+
+
+if __name__ == "__main__":
+    unittest.main()
