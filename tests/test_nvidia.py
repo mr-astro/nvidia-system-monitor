@@ -69,6 +69,22 @@ class Availability(unittest.TestCase):
         self.assertEqual(NvidiaMonitor.parse_cuda_version(banner), "12.6")
         self.assertEqual(NvidiaMonitor.parse_cuda_version("nada"), "N/D")
 
+    def test_cuda_umd_banner_of_newer_drivers(self):
+        # Real banner from driver 615.x: "CUDA UMD Version" (not "CUDA Version").
+        banner = ("| NVIDIA-SMI 615.71.09              KMD Version: 615.71.09     "
+                  "CUDA UMD Version: 13.4     |")
+        self.assertEqual(NvidiaMonitor.parse_cuda_version(banner), "13.4")
+
+    def test_get_cuda_version_never_returns_none(self):
+        # Regression: a bad edit once made this method return None ("CUDA None" in the UI).
+        with mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"):
+            m = NvidiaMonitor()
+        for output in ("", "garbage", "CUDA UMD Version: 13.4"):
+            m._cuda = None
+            m._cuda_tried_at = None
+            with mock.patch.object(m, "_run", return_value=output):
+                self.assertIsInstance(m.get_cuda_version(), str)
+
     def test_cuda_is_cached_once_found(self):
         with mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"):
             m = NvidiaMonitor()

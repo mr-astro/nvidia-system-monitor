@@ -20,7 +20,8 @@ _MISSING = {
     "[UNKNOWN ERROR]", "UNKNOWN ERROR",
 }
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
-_CUDA = re.compile(r"CUDA Version:\s*([0-9.]+)")
+# Older drivers print "CUDA Version:"; newer ones "CUDA UMD Version:".
+_CUDA = re.compile(r"CUDA (?:UMD )?Version:\s*([0-9.]+)")
 
 
 @dataclass
@@ -100,9 +101,34 @@ class NvidiaMonitor:
         for row in csv.reader(io.StringIO(text), skipinitialspace=True):
             if len(row) < n_fields:
                 continue
-            gpu_metrics = cls._row_to_metrics(row)
-            gpus.append(gpu_metrics)
+            gpus.append(cls._row_to_metrics(row))
         return gpus
+
+    @classmethod
+    def _row_to_metrics(cls, row: list) -> GpuMetrics:
+        """Map one CSV row to a GpuMetrics object."""
+        n_fields = len(cls.FIELDS)
+        # A GPU name containing commas would add extra columns; fold them back.
+        extra = len(row) - n_fields
+        name = ", ".join(part.strip() for part in row[1:2 + extra])
+        (util, total, used, free, temp, p_draw, p_limit,
+         clock_gr, clock_mem, fan, driver) = row[2 + extra:]
+        index = cls._number(row[0])
+        return GpuMetrics(
+            index=int(index) if index is not None else None,
+            name=cls._clean(name),
+            utilization_percent=cls._number(util),
+            memory_total_mb=cls._number(total),
+            memory_used_mb=cls._number(used),
+            memory_free_mb=cls._number(free),
+            temperature_c=cls._number(temp),
+            power_draw_w=cls._number(p_draw),
+            power_limit_w=cls._number(p_limit),
+            core_clock_mhz=cls._number(clock_gr),
+            memory_clock_mhz=cls._number(clock_mem),
+            fan_percent=cls._number(fan),
+            driver_version=cls._clean(driver),
+        )
 
     def get_metrics(self) -> list:
         """One list entry per GPU; empty when nvidia-smi is missing or fails."""
@@ -123,32 +149,6 @@ class NvidiaMonitor:
         """CUDA version from the nvidia-smi banner. Static, so cached once found."""
         if self._cuda is not None:
             return self._cuda
-    @classmethod
-    def _row_to_metrics(cls, row: list) -> GpuMetrics:
-        """Maps a raw CSV row to a GpuMetrics object."""
-        n_fields = len(cls.FIELDS)
-        # A GPU name containing commas would add extra columns; fold them back.
-        extra = len(row) - n_fields
-        name = ", ".join(part.strip() for part in row[1:2 + extra])
-        (util, total, used, free, temp, p_draw, p_limit,
-         clock_gr, clock_mem, fan, driver) = row[2 + extra:]
-        index = cls._number(row[0])
-
-        return GpuMetrics(
-            index=int(index) if index is not None else None,
-            name=cls._clean(name),
-            utilization_percent=cls._number(util),
-            memory_total_mb=cls._number(total),
-            memory_used_mb=cls._number(used),
-            memory_free_mb=cls._number(free),
-            temperature_c=cls._number(temp),
-            power_draw_w=cls._number(p_draw),
-            power_limit_w=cls._number(p_limit),
-            core_clock_mhz=cls._number(clock_gr),
-            memory_clock_mhz=cls._number(clock_mem),
-            fan_percent=cls._number(fan),
-            driver_version=cls._clean(driver)
-        )
         if not self.available:
             return ND
         now = time.monotonic()

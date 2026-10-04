@@ -151,6 +151,47 @@ class Temperature(unittest.TestCase):
         self.assertIsNone(fake_monitor(nvme_sysfs="/nonexistent")._nvme_temperature("nvme0n1"))
         self.assertIsNone(fake_monitor()._nvme_temperature("sda"))
 
+    def _fake_sata_sys(self, temp="27000"):
+        """sysfs with one drivetemp hwmon bound to sda and an unrelated k10temp."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        dev = f"{root}/devices/pci0000:00/ata3/host2/target2:0:0/2:0:0:0"
+        os.makedirs(f"{dev}/block/sda")
+        os.makedirs(f"{root}/block")
+        os.symlink(f"{dev}/block/sda", f"{root}/block/sda")
+        hw = f"{root}/class/hwmon/hwmon4"
+        os.makedirs(hw)
+        with open(f"{hw}/name", "w") as f:
+            f.write("drivetemp\n")
+        with open(f"{hw}/temp1_input", "w") as f:
+            f.write(temp)
+        os.symlink(dev, f"{hw}/device")
+        other = f"{root}/class/hwmon/hwmon1"
+        os.makedirs(other)
+        with open(f"{other}/name", "w") as f:
+            f.write("k10temp\n")
+        with open(f"{other}/temp1_input", "w") as f:
+            f.write("99000")
+        return root
+
+    def test_drivetemp_maps_hwmon_to_its_block_device(self):
+        m = fake_monitor(sys_dir=self._fake_sata_sys())
+        self.assertAlmostEqual(m._drivetemp_temperature("sda"), 27.0)
+
+    def test_drivetemp_does_not_leak_to_other_disks(self):
+        m = fake_monitor(sys_dir=self._fake_sata_sys())
+        self.assertIsNone(m._drivetemp_temperature("sdb"))
+
+    def test_drivetemp_missing_sysfs(self):
+        self.assertIsNone(fake_monitor(sys_dir="/nonexistent")._drivetemp_temperature("sda"))
+
+    def test_sata_disk_uses_drivetemp_before_smartctl(self):
+        m = fake_monitor(sys_dir=self._fake_sata_sys())
+        with mock.patch("src.data.storage.subprocess.run") as run:
+            self.assertAlmostEqual(m._temperature("sda"), 27.0)
+        run.assert_not_called()
+
     def _smart_monitor(self, clock):
         with mock.patch("shutil.which", side_effect=lambda n: f"/usr/bin/{n}"):
             return StorageMonitor(temperature_interval=10, failure_backoff=300, clock=clock)

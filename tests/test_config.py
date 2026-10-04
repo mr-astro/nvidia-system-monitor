@@ -54,6 +54,16 @@ class Sanitize(unittest.TestCase):
     def test_v2_example_key_is_still_honoured(self):
         self.assertEqual(sanitize({"update_interval_seconds": 3})["refresh_interval_seconds"], 3.0)
 
+    def test_sensors_panel_is_opt_in(self):
+        self.assertFalse(sanitize({})["panels"]["sensors"])
+        self.assertTrue(sanitize({"panels": {"sensors": True}})["panels"]["sensors"])
+
+    def test_theme(self):
+        self.assertEqual(sanitize({})["theme"], "dark")
+        self.assertEqual(sanitize({"theme": "System"})["theme"], "system")
+        self.assertEqual(sanitize({"theme": "neon"})["theme"], "dark")
+        self.assertEqual(sanitize({"theme": 5})["theme"], "dark")
+
     def test_unknown_keys_are_dropped(self):
         self.assertNotIn("evil", sanitize({"evil": 1}))
 

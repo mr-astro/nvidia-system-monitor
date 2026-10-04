@@ -18,8 +18,8 @@ from src.data.collector import Collector, Snapshot  # noqa: E402
 from src.data.cpu import CpuMonitor  # noqa: E402
 from src.data.nvidia import NvidiaMonitor  # noqa: E402
 from src.data.ram import RamMonitor  # noqa: E402
+from src.data.sensors import SensorMonitor  # noqa: E402
 from src.data.storage import StorageMonitor  # noqa: E402
-from src.utils.config import Config  # noqa: E402
 from src.utils.config import Config  # noqa: E402
 from src.utils.formatting import (  # noqa: E402
     fmt, fmt_bytes, fmt_mb, fmt_temp, usage_level,
@@ -27,56 +27,66 @@ from src.utils.formatting import (  # noqa: E402
 from src.utils.logger import setup_logging  # noqa: E402
 
 APP_ID = "cl.mastro.NvidiaSystemMonitor"
-PANEL_ORDER = ("cpu", "gpu", "ram", "storage")
+PANEL_ORDER = ("cpu", "gpu", "ram", "storage", "sensors")
 PANEL_TITLES = {
     "cpu": "CPU",
     "gpu": "GPU",
     "ram": "RAM",
     "storage": "Almacenamiento",
+    "sensors": "Sensores",
 }
 LEVEL_CLASSES = ("usage-low", "usage-medium", "usage-high")
 MAX_SENSOR_ROWS = 24
 
 
-def build_css(_colors: dict) -> str:
-    # CSS for mandatory dark mode based on user request.
-    return """
-window { 
-    background-color: #1e1e1e; 
-    color: #ffffff; 
-}
-headerbar {
-    background-color: #2d2d2d;
-    color: #ffffff;
-    border-bottom: 1px solid #3d3d3d;
-}
-.card, .metric-card, frame, box.card {
-    background-color: #2d2d2d;
-    border: 1px solid #3d3d3d;
-    border-radius: 8px;
-    padding: 12px;
-    margin: 6px;
-}
-headerbar label {
-    color: #ffffff;
-    font-weight: bold;
-}
-headerbar button {
-    background-color: #3d3d3d;
-    color: #ffffff;
-    border: none;
-    border-radius: 4px;
-}
-headerbar button:hover {
-    background-color: #4d4d4d;
-}
-.hw-heading {{ font-weight: 800; font-size: 180%; }}
-.hw-title {{ font-weight: 700; font-size: 130%; }}
-.hw-key {{ opacity: 0.75; }}
-.hw-value {{ font-feature-settings: "tnum"; }}
-progressbar > trough, progressbar > trough > progress {{ min-height: 6px; }}
-progressbar > trough > progress {{ background-color: #4CAF50; }}
+LEFT_PANELS = ("cpu", "ram", "sensors")
+RIGHT_PANELS = ("gpu",)
+WIDE_PANELS = ("storage",)
+
+_BASE_CSS = """
+.hw-heading, .hw-title {{ font-weight: 700; margin-bottom: 8px; }}
+.hw-card {{ padding: 12px; border-radius: 8px; }}
+.hw-key {{ font-size: 85%; }}
+.hw-value {{ font-size: 85%; font-weight: 500; font-feature-settings: "tnum"; }}
+progressbar.hw-bar trough, progressbar.hw-bar progress {{ min-height: 6px; border-radius: 3px; }}
+progressbar.usage-low progress {{ background-image: none; background-color: {low}; }}
+progressbar.usage-medium progress {{ background-image: none; background-color: {medium}; }}
+progressbar.usage-high progress {{ background-image: none; background-color: {high}; }}
 """
+
+# Neutral card used with the system theme (works on light and dark).
+_SYSTEM_CSS = """
+.hw-card {
+    border: 1px solid rgba(128, 128, 128, 0.35);
+    background-color: rgba(128, 128, 128, 0.08);
+}
+.hw-key { opacity: 0.75; }
+"""
+
+# Explicit dark palette. Independent of the GTK version (the
+# gtk-application-prefer-dark-theme setting is deprecated since GTK 4.20).
+_DARK_CSS = """
+window { background-color: #1e1e1e; color: #e0e0e0; }
+headerbar { background-color: #2d2d2d; color: #ffffff; border-bottom: 1px solid #3d3d3d; }
+headerbar label { color: #ffffff; font-weight: bold; }
+headerbar button { background-color: #3d3d3d; color: #ffffff; border: none; border-radius: 4px; }
+headerbar button:hover { background-color: #4d4d4d; }
+label { color: #e0e0e0; }
+.hw-card { background-color: #2d2d2d; border: 1px solid #3d3d3d; }
+.hw-title, .hw-heading { color: #ffffff; }
+.hw-key { color: #b0b0b0; }
+.hw-value { color: #e0e0e0; }
+progressbar.hw-bar trough { background-color: #3d3d3d; }
+"""
+
+
+def build_css(colors: dict, dark: bool = True) -> str:
+    base = _BASE_CSS.format(
+        low=colors["low_usage_color"],
+        medium=colors["medium_usage_color"],
+        high=colors["high_usage_color"],
+    )
+    return base + (_DARK_CSS if dark else _SYSTEM_CSS)
 
 
 def _set_text(label: Gtk.Label, text: str) -> None:
@@ -104,8 +114,6 @@ class MetricCard(Gtk.Box):
         self._rows: dict = {}
         self._signature = None
 
-        Gtk.Settings.get_default().props.gtk_application_prefer_dark_theme = True
-
     def reset(self, signature) -> None:
         """Rebuild from scratch only when the card's structure changes."""
         if signature == self._signature:
@@ -128,8 +136,6 @@ class MetricCard(Gtk.Box):
         value_label = Gtk.Label()
         value_label.set_xalign(1)
         value_label.set_wrap(True)
-        Gtk.Settings.get_default().props.gtk_application_prefer_dark_theme = True
-
         value_label.set_max_width_chars(44)
         value_label.add_css_class("hw-value")
         line.append(key_label)
@@ -173,12 +179,15 @@ class SystemMonitorApp(Gtk.Application):
         self.medium = float(thresholds.get("medium_percent", 60))
         self.high = float(thresholds.get("high_percent", 85))
         self.interval = float(self.config.get("refresh_interval_seconds", 1.0))
+        self.dark = self.config.get("theme", "dark") == "dark"
 
         self.collector = Collector(
             cpu=CpuMonitor() if "cpu" in self.enabled else None,
             gpu=NvidiaMonitor() if "gpu" in self.enabled else None,
             ram=RamMonitor() if "ram" in self.enabled else None,
             storage=StorageMonitor() if "storage" in self.enabled else None,
+            sensors=SensorMonitor() if "sensors" in self.enabled else None,
+            interval=self.interval,
             logger=self.logger,
         )
 
@@ -195,6 +204,7 @@ class SystemMonitorApp(Gtk.Application):
             self.window.present()
             return
 
+        self._apply_theme()
         self._install_css()
         self._build_window()
         self.collector.start()
@@ -213,95 +223,21 @@ class SystemMonitorApp(Gtk.Application):
 
     # ---- construction ---------------------------------------------------
 
+    def _apply_theme(self) -> None:
+        """Dark chrome (scrollbars, title bar) on GTK < 4.20; the CSS covers the rest."""
+        if not self.dark:
+            return
+        settings = Gtk.Settings.get_default()
+        if settings is None:
+            return
+        try:
+            settings.set_property("gtk-application-prefer-dark-theme", True)
+        except (TypeError, ValueError):
+            pass  # property removed in a future GTK: the explicit CSS still applies
+
     def _install_css(self) -> None:
         provider = Gtk.CssProvider()
-        css = """
-/* Ventana principal */
-window {
-    background-color: #1e1e1e;
-    color: #e0e0e0;
-}
-
-/* Barra superior */
-headerbar {
-    background-color: #2d2d2d;
-    color: #ffffff;
-    border-bottom: 1px solid #3d3d3d;
-}
-headerbar label {
-    color: #ffffff;
-    font-weight: bold;
-}
-headerbar button {
-    background-color: #3d3d3d;
-    color: #ffffff;
-    border: none;
-    border-radius: 4px;
-}
-headerbar button:hover {
-    background-color: #4d4d4d;
-}
-
-/* Tarjetas de hardware (CPU, GPU, RAM, Almacenamiento) */
-.hw-card {
-    background-color: #2d2d2d;
-    border: 1px solid #3d3d3d;
-    border-radius: 8px;
-    padding: 12px;
-    margin: 6px;
-}
-
-/* Títulos de las tarjetas (CPU, GPU, RAM, etc.) */
-.hw-title, .hw-heading {
-    color: #ffffff;
-    font-weight: bold;
-    font-size: 14px;
-    margin-bottom: 8px;
-}
-
-/* Etiquetas de las métricas (Modelo, Uso, Temperatura, etc.) */
-.hw-key {
-    color: #b0b0b0;
-    font-size: 12px;
-}
-
-/* Valores de las métricas (los datos numéricos) */
-.hw-value {
-    color: #e0e0e0;
-    font-weight: 500;
-    font-size: 12px;
-}
-
-/* Barras de progreso */
-.hw-bar {
-    min-height: 6px;
-    border-radius: 3px;
-}
-.hw-bar > trough {
-    background-color: #3d3d3d;
-    border-radius: 3px;
-}
-.hw-bar > trough > progress {
-    background-color: #4CAF50;
-    border-radius: 3px;
-}
-
-/* Niveles de uso (probablemente usage-low, usage-medium, usage-high) */
-.usage-low > trough > progress {
-    background-color: #4CAF50;
-}
-.usage-medium > trough > progress {
-    background-color: #FFA726;
-}
-.usage-high > trough > progress {
-    background-color: #EF5350;
-}
-
-/* Etiquetas generales */
-label {
-    color: #e0e0e0;
-}
-"""
+        css = build_css(self.config.get("color_scheme"), self.dark)
         try:
             provider.load_from_string(css)  # GTK >= 4.12
         except AttributeError:
@@ -315,7 +251,7 @@ label {
     def _build_window(self) -> None:
         self.window = Gtk.ApplicationWindow(application=self)
         self.window.set_title("NVIDIA System Monitor")
-        self.window.set_default_size(1100, 760)
+        self.window.set_default_size(1100, 880)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         for setter in (root.set_margin_top, root.set_margin_bottom,
@@ -339,17 +275,33 @@ label {
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         root.append(scroller)
 
-        grid = Gtk.Grid(column_spacing=12, row_spacing=12)
-        grid.set_hexpand(True)
-        grid.set_column_homogeneous(True)
-        scroller.set_child(grid)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        scroller.set_child(content)
 
         if not self.enabled:
-            grid.attach(Gtk.Label(label="Ningún panel habilitado en la configuración."), 0, 0, 2, 1)
-        for position, name in enumerate(self.enabled):
-            card = MetricCard(PANEL_TITLES[name])
-            self.cards[name] = card
-            grid.attach(card, position % 2, position // 2, 1, 1)
+            content.append(Gtk.Label(label="Ningún panel habilitado en la configuración."))
+
+        # Two independent columns avoid the empty gaps a shared grid leaves when
+        # cards have different heights; storage is long, so it gets the full width.
+        columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        columns.set_homogeneous(True)
+        for group in (LEFT_PANELS, RIGHT_PANELS):
+            names = [n for n in group if n in self.enabled]
+            if not names:
+                continue
+            column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            column.set_valign(Gtk.Align.START)
+            for name in names:
+                self.cards[name] = MetricCard(PANEL_TITLES[name])
+                column.append(self.cards[name])
+            columns.append(column)
+        if columns.get_first_child() is not None:
+            content.append(columns)
+
+        for name in WIDE_PANELS:
+            if name in self.enabled:
+                self.cards[name] = MetricCard(PANEL_TITLES[name])
+                content.append(self.cards[name])
 
     # ---- update loop ----------------------------------------------------
 
@@ -444,7 +396,7 @@ label {
             card.set_row(p + "mem", tag + "Memory clock", fmt(g.memory_clock_mhz, " MHz", 0))
             card.set_row(p + "fan", tag + "Ventilador", fmt(g.fan_percent, "%"))
         card.set_row("driver", "Driver", snap.gpus[0].driver_version)
-        card.set_row("cuda", "CUDA", snap.cuda_version)
+        card.set_row("cuda", "CUDA", snap.cuda_version or "N/D")
 
     def _render_ram(self, card: MetricCard, snap: Snapshot) -> None:
         r = snap.ram

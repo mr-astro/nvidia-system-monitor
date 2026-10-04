@@ -60,14 +60,16 @@ class StorageMonitor:
         topology_interval: float = 15.0,
         temperature_interval: float = 10.0,
         failure_backoff: float = 300.0,
-        nvme_sysfs: str = "/sys/class/nvme",
+        nvme_sysfs: Optional[str] = None,
+        sys_dir: str = "/sys",
         clock=time.monotonic,
     ):
         self.timeout = timeout
         self.topology_interval = topology_interval
         self.temperature_interval = temperature_interval
         self.failure_backoff = failure_backoff
-        self._nvme_sysfs = nvme_sysfs
+        self._sys = sys_dir
+        self._nvme_sysfs = nvme_sysfs or os.path.join(sys_dir, "class", "nvme")
         self._clock = clock
         self._lsblk = shutil.which("lsblk")
         self._smartctl = shutil.which("smartctl")
@@ -192,6 +194,33 @@ class StorageMonitor:
                     continue
         return None
 
+    def _drivetemp_temperature(self, name: str) -> Optional[float]:
+        """Temperature of a SATA/SCSI disk via the kernel's `drivetemp` module.
+
+        Needs no root, but the module must be loaded (`sudo modprobe drivetemp`).
+        Each hwmon device is matched to its block device through sysfs: the
+        disk's real path lives under the hwmon device's SCSI device.
+        """
+        base = os.path.join(self._sys, "class", "hwmon")
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            return None
+        block = os.path.realpath(os.path.join(self._sys, "block", name))
+        for hw in entries:
+            try:
+                with open(os.path.join(base, hw, "name"), encoding="utf-8") as f:
+                    if f.read().strip() != "drivetemp":
+                        continue
+                device = os.path.realpath(os.path.join(base, hw, "device"))
+                if not block.startswith(device + os.sep):
+                    continue
+                with open(os.path.join(base, hw, "temp1_input"), encoding="utf-8") as f:
+                    return float(f.read().strip()) / 1000.0
+            except (OSError, ValueError):
+                continue
+        return None
+
     @staticmethod
     def parse_smart_temperature(text: str) -> Optional[float]:
         """Temperature from `smartctl -A` output (ATA, NVMe and SCSI layouts)."""
@@ -236,6 +265,10 @@ class StorageMonitor:
     def _temperature(self, name: str) -> Optional[float]:
         if name.startswith("nvme"):
             value = self._nvme_temperature(name)
+            if value is not None:
+                return value
+        else:
+            value = self._drivetemp_temperature(name)
             if value is not None:
                 return value
         return self._smart_temperature(name)

@@ -1,6 +1,8 @@
 # NVIDIA System Monitor for LINUX
 
-Monitor de escritorio GTK4 para Fedora Linux: GPU NVIDIA, CPU, RAM, almacenamiento y sensores.
+![Captura de la aplicación](screenshot.png)
+
+Monitor de escritorio GTK4 para Linux (desarrollado y probado en Fedora): GPU NVIDIA, CPU, RAM y almacenamiento, con sensores opcionales.
 
 ## Qué monitoriza
 
@@ -19,11 +21,14 @@ sistema de archivos, punto(s) de montaje y uso. Si un dispositivo tiene varios m
 (p. ej. subvolúmenes btrfs en `/` y `/home`), el uso mostrado es el del sistema de
 archivos completo.
 
-**Sensores**: lecturas de temperatura de `lm_sensors`.
+**Sensores** (opcional, desactivado por defecto): lecturas de temperatura de `lm_sensors`,
+útiles para ver la placa base. Se activa con `"sensors": true` en `panels`.
 
 Los datos ausentes se muestran como `N/D`; nunca se sustituyen por valores inventados.
 
-## Instalación en Fedora
+## Instalación
+
+### Fedora
 
 ```bash
 sudo dnf install gtk4 python3-gobject
@@ -31,23 +36,33 @@ sudo dnf install gtk4 python3-gobject
 
 ### Otras distribuciones
 
-- **Ubuntu / Debian**: 
-```bash 
-sudo apt install gtk4 python3-gobject gir1.2-gtk-4.0 gir1.2-adw-1
-```
-- **Arch Linux / Manjaro**: 
+- **Ubuntu / Debian** (nombres de paquete verificados contra los repositorios de Ubuntu 24.04):
+
 ```bash
-sudo pacman -S gtk4 python-gobject libadwaita
+sudo apt install python3-gi gir1.2-gtk-4.0
 ```
 
-Opcionales:
+- **Arch Linux / Manjaro** (sin probar):
+
+```bash
+sudo pacman -S gtk4 python-gobject
+```
+
+No se necesita `pip` ni libadwaita.
+
+### Opcionales
 
 ```bash
 sudo dnf install lm_sensors        # panel de sensores
-sudo dnf install smartmontools     # temperatura de discos SATA (requiere root, ver Limitaciones)
+sudo dnf install smartmontools     # temperatura de discos SATA/USB (requiere root)
 ```
 
-No se necesita `pip`.
+**Temperatura de discos SATA sin root:** cargue el módulo `drivetemp` del kernel.
+
+```bash
+sudo modprobe drivetemp                                         # hasta el próximo reinicio
+echo drivetemp | sudo tee /etc/modules-load.d/drivetemp.conf    # permanente
+```
 
 ## Ejecución
 
@@ -73,9 +88,11 @@ valores inválidos se ignoran y se usa el valor por defecto.
 |---|---|---|
 | `refresh_interval_seconds` | `1.0` | Intervalo de actualización (0.5 – 60). |
 | `temperature_unit` | `"C"` | `"C"` o `"F"`. |
+| `theme` | `"dark"` | `"dark"` (paleta oscura propia) o `"system"` (usa el tema del sistema). |
 | `logging_enabled` | `true` | Escribe el registro en disco. |
-| `panels.cpu / gpu / ram / storage / sensors` | `true` | Muestra u oculta cada panel. Un panel oculto tampoco se consulta. |
-| `color_scheme.low/medium/high_usage_color` | verde / ámbar / rojo | Colores de las barras de uso, en formato `#RRGGBB`. |
+| `panels.cpu / gpu / ram / storage` | `true` | Muestra u oculta cada panel. Un panel oculto tampoco se consulta. |
+| `panels.sensors` | `false` | Panel de sensores de `lm_sensors`. |
+| `color_scheme.low/medium/high_usage_color` | verde / naranja / rojo | Colores de las barras de uso, en formato `#RRGGBB`. |
 | `thresholds.medium_percent / high_percent` | `60` / `85` | Porcentajes a partir de los cuales la barra cambia de color. |
 
 Registro: `~/.local/state/nvidia-system-monitor/monitor.log` (rotativo, máx. 3 × 512 KB).
@@ -86,10 +103,12 @@ Registro: `~/.local/state/nvidia-system-monitor/monitor.log` (rotativo, máx. 3 
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Las pruebas usan datos simulados (salidas de `nvidia-smi`, `lsblk`, `sensors`, `smartctl`,
-`/proc`, `/sys`) y no dependen del hardware de la máquina. Las pruebas de interfaz se
+Las pruebas usan datos simulados (salidas de `nvidia-smi`, `lsblk`, `sensors`, `smartctl`, `/proc`, `/sys`) y no dependen del hardware de la máquina. Las pruebas de interfaz se
 omiten automáticamente si no hay GTK 4 o pantalla; para ejecutarlas en una sesión sin
 entorno gráfico: `xvfb-run -a python3 -m unittest discover -s tests -t .`
+
+El flujo de GitHub Actions (`.github/workflows/tests.yml`) ejecuta toda la suite, incluida
+la interfaz, en cada `push` y `pull request`.
 
 ## Diseño técnico
 
@@ -102,20 +121,21 @@ tests/                  pruebas unitarias y de humo de la GUI
 ```
 
 - Toda la recolección (subprocesos y lecturas de `/proc` y `/sys`) corre en **un único hilo
-  en segundo plano**. El bucle de GTK solo lee la última instantánea y actualiza los
-  widgets existentes, por lo que un `nvidia-smi` lento o colgado no congela la ventana.
+en segundo plano**. El bucle de GTK solo lee la última instantánea y actualiza los
+widgets existentes, por lo que un `nvidia-smi` lento o colgado no congela la ventana.
 - Cada fuente falla de forma aislada: si una falla, las demás siguen funcionando y el
-  encabezado muestra un aviso (el detalle aparece al pasar el cursor).
+encabezado muestra un aviso (el detalle aparece al pasar el cursor).
 - La topología de discos (`lsblk`) se consulta cada 15 s; los sensores, cada 5 s;
-  `smartctl`, como máximo cada 10 s por disco (cada 5 min si falla).
+`smartctl`, como máximo cada 10 s por disco (cada 5 min si falla).
 - No se ejecutan benchmarks de almacenamiento.
 
 ## Limitaciones
 
 - La disponibilidad de temperaturas y consumo depende del hardware, el driver y los
-  sensores que Linux exponga.
+sensores que Linux exponga.
 - **No se muestra el consumo eléctrico de la CPU**: no existe una fuente fiable y
-  universal sin privilegios, y no se presenta una estimación como si fuera una medición.
-- La temperatura de discos NVMe se lee de sysfs sin privilegios. La de discos SATA/USB
-  usa `smartctl`, que normalmente exige root; sin él se muestra `N/D`.
+universal sin privilegios, y no se presenta una estimación como si fuera una medición.
+- La temperatura de discos NVMe se lee de sysfs sin privilegios. La de discos SATA se
+obtiene del módulo `drivetemp` si está cargado; si no, de `smartctl`, que normalmente
+exige root. Sin ninguna de las dos se muestra `N/D`.
 - Solo se consulta `nvidia-smi`; no hay soporte para GPU AMD o Intel.

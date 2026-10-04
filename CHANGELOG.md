@@ -1,5 +1,49 @@
 # Cambios
 
+## 3.1.0
+
+Sobre el repositorio publicado (commit `435a799`). Se conservan sus decisiones: tema
+oscuro, paleta de colores, panel de sensores fuera de la vista y la reorganización de la
+documentación.
+
+### Errores corregidos
+- **CUDA mostraba `None`.** Al extraer `_row_to_metrics()` en `nvidia.py`, el método se
+  insertó en mitad de `get_cuda_version()`: su cuerpo quedó como código inalcanzable y la
+  función devolvía `None`. Reubicado, conservando el refactor.
+- **CUDA mostraba `N/D` en drivers recientes.** El banner de `nvidia-smi` 615.x dice
+  `CUDA UMD Version: 13.4`, no `CUDA Version:`. La expresión regular acepta ambos.
+- **El intervalo de refresco configurado se ignoraba:** se había quitado `interval=`
+  al crear el `Collector`.
+- **Los colores y umbrales de la configuración no se aplicaban:** coexistían dos CSS y
+  se usaba uno con colores fijos (`build_css` era código muerto, además con llaves `{{ }}`
+  sin escapar en una cadena que no era f-string).
+- **Tema aplicado una vez** en lugar de en cada fila: `gtk-application-prefer-dark-theme`
+  se asignaba dentro de `MetricCard.__init__` y de `_create_row`.
+- Eliminados `src/test_validators.py` (reportaba «0 passed, 0 failed» con éxito) y el
+  `nvidia-system-monitor.desktop` antiguo (`Exec=... %k/...` no funciona). Los reemplazan
+  `tests/` e `install.sh`, ya presentes.
+- Import duplicado de `Config`.
+- README: los paquetes de Ubuntu/Debian (`gtk4`, `python3-gobject`) no existen en sus
+  repositorios; el correcto es `python3-gi gir1.2-gtk-4.0`. `libadwaita` no se usa.
+
+### Novedades
+- **Temperatura de discos SATA sin root** mediante el módulo `drivetemp` (se asocia cada
+  `hwmon` a su disco a través de sysfs). Orden: sysfs NVMe → `drivetemp` → `smartctl`.
+- **Opción `theme`** (`"dark"` por defecto, o `"system"`). El modo oscuro se basa en CSS
+  propio y no depende de la propiedad `gtk-application-prefer-dark-theme`, obsoleta desde
+  GTK 4.20.
+- **Diseño en dos columnas independientes** (CPU y RAM a la izquierda, GPU a la derecha) y
+  almacenamiento a todo el ancho, sin los huecos que dejaba la cuadrícula.
+- **Panel de sensores opcional** (`panels.sensors`, desactivado por defecto).
+- Tamaños de fuente en porcentaje (respetan la escala de texto del sistema).
+- **CI en GitHub Actions** (`.github/workflows/tests.yml`): ejecuta la suite completa,
+  incluida la GUI bajo Xvfb, en cada `push`.
+- 15 pruebas nuevas, entre ellas una por cada regresión anterior (CUDA, intervalo, colores,
+  CSS sin errores de análisis, diseño).
+
+### Cambios
+- Paleta por defecto: naranja `#FFA726` y rojo `#EF5350` (la suya) en lugar de los de v3.0.
+
 ## 3.0.0 — versión corregida
 
 ### Errores corregidos

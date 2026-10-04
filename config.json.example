@@ -1,6 +1,7 @@
 {
   "refresh_interval_seconds": 1.0,
   "temperature_unit": "C",
+  "theme": "dark",
   "logging_enabled": true,
 
   "panels": {
@@ -8,13 +9,13 @@
     "gpu": true,
     "ram": true,
     "storage": true,
-    "sensors": true
+    "sensors": false
   },
 
   "color_scheme": {
     "low_usage_color": "#4CAF50",
-    "medium_usage_color": "#FFC107",
-    "high_usage_color": "#F44336"
+    "medium_usage_color": "#FFA726",
+    "high_usage_color": "#EF5350"
   },
 
   "thresholds": {

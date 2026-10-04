@@ -88,6 +88,61 @@ class GuiSmoke(unittest.TestCase):
         cpu_bar = app.cards["cpu"]._rows["usage"][2]    # 42 % -> low
         self.assertTrue(cpu_bar.has_css_class("usage-low"))
 
+    def test_cuda_is_never_rendered_as_none(self):
+        app = self._app()
+        snap = full_snapshot()
+        snap.cuda_version = None
+        app._render(snap)
+        self.assertEqual(app.cards["gpu"]._rows["cuda"][1].get_label(), "N/D")
+        app._render(full_snapshot())
+        self.assertEqual(app.cards["gpu"]._rows["cuda"][1].get_label(), "12.6")
+
+    def test_collector_uses_the_configured_interval(self):
+        # Regression: the interval was once dropped when building the Collector.
+        self.assertEqual(self._app(refresh_interval_seconds=2.5).collector.interval, 2.5)
+
+    def test_sensors_panel_is_off_by_default_and_opt_in(self):
+        self.assertNotIn("sensors", self._app().cards)
+        app = self._app(panels={"sensors": True})
+        app._render(full_snapshot())
+        self.assertIn("sensors", app.cards)
+        self.assertEqual(app.cards["sensors"]._rows["s0"][1].get_label(), "45.2 °C")
+
+    def test_config_colors_are_applied_to_the_css(self):
+        # Regression: colors from the configuration were once ignored.
+        from src.gui.app import build_css
+        colors = {"low_usage_color": "#010203", "medium_usage_color": "#040506",
+                  "high_usage_color": "#070809"}
+        css = build_css(colors, dark=True)
+        for value in colors.values():
+            self.assertIn(value, css)
+
+    def test_css_has_no_parse_errors_in_either_theme(self):
+        from src.gui.app import build_css
+        from src.utils.config import DEFAULT_CONFIG
+        for dark in (True, False):
+            errors = []
+            provider = Gtk.CssProvider()
+            provider.connect("parsing-error", lambda p, section, err: errors.append(err.message))
+            provider.load_from_string(build_css(DEFAULT_CONFIG["color_scheme"], dark))
+            self.assertEqual(errors, [], f"dark={dark}")
+
+    def test_system_theme_does_not_force_dark_colors(self):
+        from src.gui.app import build_css
+        from src.utils.config import DEFAULT_CONFIG
+        colors = DEFAULT_CONFIG["color_scheme"]
+        self.assertIn("#1e1e1e", build_css(colors, dark=True))
+        self.assertNotIn("#1e1e1e", build_css(colors, dark=False))
+        self.assertFalse(self._app(theme="system").dark)
+        self.assertTrue(self._app().dark)
+
+    def test_storage_is_full_width_and_cards_are_in_two_columns(self):
+        app = self._app()
+        cpu, ram, gpu, storage = (app.cards[n] for n in ("cpu", "ram", "gpu", "storage"))
+        self.assertIs(cpu.get_parent(), ram.get_parent())       # left column
+        self.assertIsNot(cpu.get_parent(), gpu.get_parent())    # right column
+        self.assertIs(cpu.get_parent().get_parent().get_parent(), storage.get_parent())
+
     def test_fahrenheit(self):
         app = self._app(temperature_unit="F")
         app._render(full_snapshot())

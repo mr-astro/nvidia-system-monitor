@@ -16,18 +16,19 @@ from src.utils.paths import config_dir
 DEFAULT_CONFIG = {
     "refresh_interval_seconds": 1.0,
     "temperature_unit": "C",
+    "theme": "dark",
     "logging_enabled": True,
     "panels": {
         "cpu": True,
         "gpu": True,
         "ram": True,
         "storage": True,
-        "sensors": True,
+        "sensors": False,
     },
     "color_scheme": {
         "low_usage_color": "#4CAF50",
-        "medium_usage_color": "#FFC107",
-        "high_usage_color": "#F44336",
+        "medium_usage_color": "#FFA726",
+        "high_usage_color": "#EF5350",
     },
     "thresholds": {
         "medium_percent": 60,
@@ -62,6 +63,10 @@ def sanitize(data: dict) -> dict:
     unit = data.get("temperature_unit")
     if isinstance(unit, str) and unit.strip().upper() in {"C", "F"}:
         out["temperature_unit"] = unit.strip().upper()
+
+    theme = data.get("theme")
+    if isinstance(theme, str) and theme.strip().lower() in {"dark", "system"}:
+        out["theme"] = theme.strip().lower()
 
     if isinstance(data.get("logging_enabled"), bool):
         out["logging_enabled"] = data["logging_enabled"]
