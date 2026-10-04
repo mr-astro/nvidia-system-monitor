@@ -2,6 +2,24 @@
 # Instala (o desinstala) el lanzador de escritorio para el usuario actual.
 #   ./install.sh              crea el .desktop y copia la configuración de ejemplo
 #   ./install.sh --uninstall  elimina el .desktop (no toca la configuración)
+#!/bin/bash
+
+# Ruta del icono en el repositorio
+ICON_SOURCE="assets/icons/cl.mastro.NvidiaSystemMonitor.png"
+
+# Ruta de destino en el sistema
+ICON_DEST="/usr/share/icons/hicolor/scalable/apps/cl.mastro.NvidiaSystemMonitor.png"
+
+# Copiar el icono
+if [ -f "$ICON_SOURCE" ]; then
+    sudo cp "$ICON_SOURCE" "$ICON_DEST"
+    sudo gtk-update-icon-cache /usr/share/icons/hicolor/
+    echo "Icono instalado correctamente."
+else
+    echo "Error: No se encontró el icono en $ICON_SOURCE"
+    exit 1
+fi
+
 set -euo pipefail
 shopt -u patsub_replacement 2>/dev/null || true
 
