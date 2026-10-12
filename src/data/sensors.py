@@ -12,6 +12,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
+from src.data.errors import command_error
+
 _TEMP_INPUT = re.compile(r"^(temp\d+)_input:\s*(-?\d+(?:\.\d+)?)")
 
 
@@ -63,13 +65,16 @@ class SensorMonitor:
     def __init__(self, timeout: float = 2.0):
         self.timeout = timeout
         self._binary = shutil.which("sensors")
+        self.errors = {}
 
     @property
     def available(self) -> bool:
         return self._binary is not None
 
     def get_readings(self) -> list:
+        self.errors.clear()
         if not self._binary:
+            self.errors["sensors"] = "sensors: utilidad no disponible"
             return []
         try:
             result = subprocess.run(
@@ -79,8 +84,14 @@ class SensorMonitor:
                 timeout=self.timeout,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.errors["sensors"] = command_error("sensors", exception=exc)
             return []
         if result.returncode != 0:
+            self.errors["sensors"] = command_error("sensors", result=result)
             return []
-        return parse_sensors_output(result.stdout)
+        readings = parse_sensors_output(result.stdout)
+        input_lines = sum(bool(re.match(r"^temp\d+_input:", line.strip())) for line in result.stdout.splitlines())
+        if len(readings) != input_lines:
+            self.errors["sensors"] = "sensors: respuesta de temperaturas malformada"
+        return readings

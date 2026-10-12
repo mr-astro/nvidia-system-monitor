@@ -1,4 +1,6 @@
 import unittest
+import subprocess
+from types import SimpleNamespace
 from unittest import mock
 
 from src.data.nvidia import NvidiaMonitor, GpuMetrics
@@ -100,6 +102,56 @@ class Availability(unittest.TestCase):
             m.get_cuda_version()
             m.get_cuda_version()
         self.assertEqual(run.call_count, 1)
+
+
+class CommandFailures(unittest.TestCase):
+    def setUp(self):
+        with mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"):
+            self.monitor = NvidiaMonitor()
+
+    def test_execution_failures_are_reported_and_recover(self):
+        for failure in (subprocess.TimeoutExpired("nvidia-smi", 2), OSError("driver unavailable")):
+            with self.subTest(failure=failure), mock.patch("src.data.nvidia.subprocess.run", side_effect=failure):
+                self.assertEqual(self.monitor.get_metrics(), [])
+                self.assertIn("nvidia-smi", self.monitor.errors["gpu"])
+        with mock.patch("src.data.nvidia.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=ROW)):
+            self.assertEqual(len(self.monitor.get_metrics()), 1)
+        self.assertNotIn("gpu", self.monitor.errors)
+
+    def test_nonzero_exit_retains_bounded_stderr(self):
+        result = SimpleNamespace(returncode=9, stdout="", stderr="driver lost\n" + "x" * 1000)
+        with mock.patch("src.data.nvidia.subprocess.run", return_value=result):
+            self.monitor.get_metrics()
+        message = self.monitor.errors["gpu"]
+        self.assertIn("salida 9", message)
+        self.assertIn("driver lost", message)
+        self.assertLess(len(message), 450)
+
+    def test_malformed_output_is_not_a_successful_measurement(self):
+        for output in ("", "garbage", ROW + "\n0, partial", ROW.replace(", 12,", ", nonsense,"), ROW.replace("[N/A]", "[Unknown Error]")):
+            with self.subTest(output=output), mock.patch("src.data.nvidia.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=output)):
+                self.monitor.get_metrics()
+                self.assertIn("gpu", self.monitor.errors)
+
+    def test_unsupported_fields_remain_valid(self):
+        with mock.patch("src.data.nvidia.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=ROW)):
+            gpu, = self.monitor.get_metrics()
+        self.assertIsNone(gpu.fan_percent)
+        self.assertEqual(self.monitor.errors, {})
+
+    def test_cuda_error_persists_during_backoff_and_clears_on_recovery(self):
+        with mock.patch("src.data.nvidia.time.monotonic", return_value=0), mock.patch(
+            "src.data.nvidia.subprocess.run", side_effect=subprocess.TimeoutExpired("nvidia-smi", 2)
+        ) as run:
+            self.assertEqual(self.monitor.get_cuda_version(), "N/D")
+            self.assertEqual(self.monitor.get_cuda_version(), "N/D")
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("timeout", self.monitor.errors["cuda"])
+        with mock.patch("src.data.nvidia.time.monotonic", return_value=61), mock.patch(
+            "src.data.nvidia.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="CUDA UMD Version: 13.4")
+        ):
+            self.assertEqual(self.monitor.get_cuda_version(), "13.4")
+        self.assertNotIn("cuda", self.monitor.errors)
 
 
 if __name__ == "__main__":

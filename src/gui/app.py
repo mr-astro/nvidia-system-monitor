@@ -195,7 +195,9 @@ class SystemMonitorApp(Gtk.Application):
         self.status = None
         self.cards: dict = {}
         self._last_sequence = 0
+        self._last_age_render = None
         self._last_render_error: dict = {}
+        self._render_attempts: dict = {}
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -309,25 +311,42 @@ class SystemMonitorApp(Gtk.Application):
         if self.window is None:
             return GLib.SOURCE_REMOVE
         snapshot = self.collector.latest()
-        if snapshot.sequence and snapshot.sequence != self._last_sequence:
+        second = int(time.monotonic())
+        if snapshot.sequence and (snapshot.sequence != self._last_sequence or second != self._last_age_render):
             self._last_sequence = snapshot.sequence
+            self._last_age_render = second
             self._render(snapshot)
         self._update_status(snapshot)
         return GLib.SOURCE_CONTINUE
 
+    @staticmethod
+    def _source_note(state, now):
+        age = state.age(now)
+        if age is None:
+            return "Sin medición válida" + (f" · {state.error}" if state.error else "")
+        prefix = "Obsoleto" if state.stale(now) else "Medido"
+        return f"{prefix} · hace {age:.0f} s" + (f" · {state.error}" if state.error else "")
+
     def _update_status(self, snap: Snapshot) -> None:
         if not snap.sequence:
             return
-        age = time.monotonic() - snap.timestamp
-        if age > self.interval * 5 + 5:
+        now = time.monotonic()
+        errors = dict(snap.errors)
+        errors.update({f"interfaz:{k}": v for k, v in self._last_render_error.items()})
+        stale = {k: v for k, v in snap.sources.items() if v.stale(now)}
+        details = [f"{k}: {v}" for k, v in errors.items()]
+        details.extend(f"{k}: {self._source_note(v, now)}" for k, v in stale.items())
+        if errors or stale:
+            _set_text(self.status, "Avisos: " + ", ".join(sorted(set(errors) | set(stale))))
+        elif snap.sources:
+            ages = [v.age(now) for v in snap.sources.values() if v.acquired_at is not None]
+            age = max(ages) if ages else None
+            _set_text(self.status, f"Mediciones de hace {age:.0f} s" if age is not None else "Sin mediciones válidas")
+        elif now - snap.timestamp > self.interval * 5 + 5:
             _set_text(self.status, "Sin datos recientes")
-        elif snap.errors:
-            _set_text(self.status, "Actualizado con avisos: " + ", ".join(sorted(snap.errors)))
         else:
-            _set_text(self.status, "Actualizado " + time.strftime("%H:%M:%S"))
-        self.status.set_tooltip_text(
-            "\n".join(f"{k}: {v}" for k, v in snap.errors.items()) or None
-        )
+            _set_text(self.status, f"Instantánea recibida hace {max(0, now - snap.timestamp):.0f} s")
+        self.status.set_tooltip_text("\n".join(details) or None)
 
     def _render(self, snap: Snapshot) -> None:
         renderers = {
@@ -338,13 +357,40 @@ class SystemMonitorApp(Gtk.Application):
             "sensors": self._render_sensors,
         }
         for name, card in self.cards.items():
+            if name in self._last_render_error and self._render_attempts.get(name) == snap.sequence:
+                continue
+            self._render_attempts[name] = snap.sequence
+            target = card
+            # Retry into a detached card so a repeated failure cannot destroy the
+            # visible error row or expose partially drawn values.
+            if name in self._last_render_error:
+                card = MetricCard(PANEL_TITLES[name])
             try:
-                renderers[name](card, snap)
+                state = snap.sources.get(name)
+                now = time.monotonic()
+                if name in {"cpu", "ram", "gpu", "sensors"} and state and state.stale(now):
+                    card.reset(("stale", name))
+                    card.set_row("state", "Estado", self._source_note(state, now))
+                else:
+                    renderers[name](card, snap)
+                    if state and name != "storage":
+                        card.set_row("freshness", "Medición", self._source_note(state, now))
+                if card is not target:
+                    target.remove(target.body)
+                    body = card.body
+                    card.remove(body)
+                    target.body = body
+                    target.append(body)
+                    target._rows = card._rows
+                    target._signature = card._signature
+                self._last_render_error.pop(name, None)
             except Exception as exc:  # a rendering bug must not kill the loop
                 message = f"{type(exc).__name__}: {exc}"
                 if self._last_render_error.get(name) != message:
                     self._last_render_error[name] = message
                     self.logger.exception("Error dibujando el panel '%s'", name)
+                target.reset(("render-error", name))
+                target.set_row("state", "Estado", "Error al mostrar las métricas")
 
     def _level(self, percent):
         return usage_level(percent, self.medium, self.high)
@@ -423,15 +469,24 @@ class SystemMonitorApp(Gtk.Application):
             return self._no_data(card, "No se detectaron discos")
 
         signature = ("storage", tuple(
-            (d.name, tuple((p.name, p.depth, p.used_bytes is not None) for p in d.partitions))
+            (d.name, bool(snap.sources.get("smart:" + d.name) or snap.sources.get("temperature:" + d.name)),
+             tuple((p.name, p.depth, p.used_bytes is not None, "usage:" + p.name in snap.sources)
+                   for p in d.partitions))
             for d in disks
-        ))
+        ), "topology" in snap.sources)
         card.reset(signature)
+        now = time.monotonic()
+        topology = snap.sources.get("topology")
+        if topology:
+            card.set_row("topology-state", "Topología", self._source_note(topology, now))
         for d in disks:
             card.set_row(
                 f"disk:{d.name}", d.name,
                 f"{d.kind} · {fmt_bytes(d.size_bytes)} · {fmt_temp(d.temperature_c, self.unit)}",
             )
+            temperature = snap.sources.get("smart:" + d.name) or snap.sources.get("temperature:" + d.name)
+            if temperature:
+                card.set_row(f"temperature-state:{d.name}", "  Temperatura", self._source_note(temperature, now))
             if not d.partitions:
                 card.set_row(f"nopart:{d.name}", "  Particiones", "N/D")
             for p in d.partitions:
@@ -439,6 +494,9 @@ class SystemMonitorApp(Gtk.Application):
                 mount = ", ".join(p.mountpoints) if p.mountpoints else "Sin montaje"
                 card.set_row(f"part:{d.name}:{p.name}", f"{indent}{p.name}",
                              f"{p.fstype} · {fmt_bytes(p.size_bytes)} · {mount}")
+                usage = snap.sources.get("usage:" + p.name)
+                if usage:
+                    card.set_row(f"usage-state:{d.name}:{p.name}", f"{indent}  Medición", self._source_note(usage, now))
                 if p.used_bytes is not None:
                     card.set_row(
                         f"use:{d.name}:{p.name}", f"{indent}  Uso",

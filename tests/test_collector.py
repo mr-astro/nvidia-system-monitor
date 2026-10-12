@@ -6,6 +6,11 @@ from src.data.collector import Collector
 from src.data.cpu import CpuMetrics
 from src.data.nvidia import GpuMetrics
 from src.data.ram import RamMetrics
+from src.data.errors import SourceState, freshness
+from src.data.nvidia import NvidiaMonitor
+from src.data.sensors import SensorMonitor
+import subprocess
+from types import SimpleNamespace
 
 
 class Cpu:
@@ -152,6 +157,104 @@ class Threading(unittest.TestCase):
             self.assertIs(c._thread, first)
         finally:
             c.stop()
+
+
+class Reliability(unittest.TestCase):
+    def test_acquisition_times_are_independent_of_publication_and_wall_clock(self):
+        now = [10.0]
+
+        class SlowGpu(Gpu):
+            timeout = 2.0
+
+            def get_metrics(self):
+                now[0] += 1.8
+                return super().get_metrics()
+
+        collector = Collector(cpu=Cpu(), ram=Ram(), gpu=SlowGpu(), clock=lambda: now[0])
+        with mock.patch("time.time", return_value=-10000):
+            snap = collector.collect_once()
+        self.assertEqual(snap.acquisition_started_at, 10)
+        self.assertEqual(snap.sources["cpu"].acquired_at, 10)
+        self.assertEqual(snap.sources["gpu"].acquired_at, 10)
+        self.assertEqual(snap.timestamp, 11.8)
+        self.assertEqual(snap.sources["gpu"].completed_at, 11.8)
+        self.assertAlmostEqual(snap.sources["gpu"].age(snap.timestamp), 1.8)
+        self.assertEqual(snap.sources["cpu"].max_age, freshness(1))
+        self.assertEqual(snap.sources["ram"].max_age, freshness(1))
+        self.assertEqual(snap.sources["gpu"].max_age, freshness(1, 2))
+
+    def test_sensor_failure_persists_until_success_and_keeps_original_age(self):
+        now = [0.0]
+        sensor = mock.Mock(timeout=2, errors={})
+        sensor.get_readings.side_effect = [["valid"], RuntimeError("disconnected"), ["recovered"]]
+        collector = Collector(sensors=sensor, clock=lambda: now[0])
+        first = collector.collect_once()
+        now[0] = 5
+        failed = collector.collect_once()
+        self.assertIn("sensors", failed.errors)
+        self.assertEqual(failed.sensors, ["valid"])
+        self.assertEqual(failed.sources["sensors"].acquired_at, 0)
+        now[0] = 6
+        cached = collector.collect_once()
+        self.assertEqual(cached.errors, failed.errors)
+        self.assertEqual(sensor.get_readings.call_count, 2)
+        self.assertEqual(first.errors, {})  # published snapshots are not mutated
+        now[0] = 10
+        recovered = collector.collect_once()
+        self.assertNotIn("sensors", recovered.errors)
+        self.assertEqual(recovered.sensors, ["recovered"])
+        self.assertEqual(recovered.sources["sensors"].acquired_at, 10)
+
+    def test_real_sensor_timeout_survives_unscheduled_cycles(self):
+        now = [0.0]
+        with mock.patch("shutil.which", return_value="/usr/bin/sensors"):
+            sensor = SensorMonitor()
+        collector = Collector(cpu=Cpu(), sensors=sensor, clock=lambda: now[0])
+        with mock.patch("src.data.sensors.subprocess.run", side_effect=subprocess.TimeoutExpired("sensors", 2)):
+            snap = collector.collect_once()
+        now[0] = 1
+        cached = collector.collect_once()
+        self.assertEqual(snap.errors, cached.errors)
+        self.assertIn("timeout", cached.errors["sensors"])
+        self.assertIsNotNone(cached.cpu)
+
+    def test_normal_sensor_cache_does_not_refresh_measurement_or_warn(self):
+        now = [0.0]
+        collector = Collector(sensors=Sensors(), clock=lambda: now[0])
+        collector.collect_once()
+        now[0] = 4.9
+        snap = collector.collect_once()
+        state = snap.sources["sensors"]
+        self.assertEqual(state.acquired_at, 0)
+        self.assertFalse(state.stale(now[0]))
+        self.assertTrue(state.stale(state.max_age + 0.1))
+
+    def test_thousands_of_gpu_cycles_fail_recover_and_rate_limit_logs(self):
+        from tests.test_nvidia import ROW
+        now = [0.0]
+        logger = mock.Mock()
+        with mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"):
+            gpu = NvidiaMonitor()
+        gpu._cuda = "13.4"
+        collector = Collector(cpu=Cpu(), ram=Ram(), gpu=gpu, logger=logger, clock=lambda: now[0])
+        good = SimpleNamespace(returncode=0, stdout=ROW)
+        for cycle in range(3600):
+            now[0] = float(cycle)
+            failure = 100 <= cycle < 220
+            with mock.patch("src.data.nvidia.subprocess.run", **(
+                {"side_effect": subprocess.TimeoutExpired("nvidia-smi", 2)} if failure else {"return_value": good}
+            )):
+                snap = collector.collect_once()
+            self.assertEqual(snap.sequence, cycle + 1)
+            self.assertIsNotNone(snap.cpu)
+            self.assertIsNotNone(snap.ram)
+            self.assertEqual("gpu" in snap.errors, failure)
+            if failure:
+                self.assertEqual(snap.sources["gpu"].acquired_at, 99)
+            else:
+                self.assertEqual(snap.sources["gpu"].acquired_at, cycle)
+        self.assertEqual(logger.error.call_count, 2)
+        self.assertEqual(len(collector._states), 3)
 
 
 if __name__ == "__main__":

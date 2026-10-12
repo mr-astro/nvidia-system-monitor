@@ -1,6 +1,9 @@
 import unittest
+import subprocess
+from types import SimpleNamespace
+from unittest import mock
 
-from src.data.sensors import parse_sensors_output
+from src.data.sensors import SensorMonitor, parse_sensors_output
 
 SAMPLE = """k10temp-pci-00c3
 Adapter: PCI adapter
@@ -55,6 +58,48 @@ class Sensors(unittest.TestCase):
     def test_empty_and_garbage(self):
         self.assertEqual(parse_sensors_output(""), [])
         self.assertEqual(parse_sensors_output("  temp1_input: 5\nrandom"), [])
+
+
+class SensorCommands(unittest.TestCase):
+    def test_command_errors_and_recovery(self):
+        with mock.patch("shutil.which", return_value="/usr/bin/sensors"):
+            monitor = SensorMonitor()
+        for failure in (OSError("unavailable"), subprocess.TimeoutExpired("sensors", 2)):
+            with self.subTest(failure=failure), mock.patch("src.data.sensors.subprocess.run", side_effect=failure):
+                self.assertEqual(monitor.get_readings(), [])
+                self.assertIn("sensors", monitor.errors)
+        with mock.patch("src.data.sensors.subprocess.run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="No sensors found")):
+            monitor.get_readings()
+        self.assertIn("No sensors found", monitor.errors["sensors"])
+        with mock.patch("src.data.sensors.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=SAMPLE)):
+            self.assertEqual(len(monitor.get_readings()), 5)
+        self.assertEqual(monitor.errors, {})
+
+    def test_missing_utility_and_malformed_temperature(self):
+        with mock.patch("shutil.which", return_value=None):
+            monitor = SensorMonitor()
+        monitor.get_readings()
+        self.assertIn("no disponible", monitor.errors["sensors"])
+        monitor._binary = "/usr/bin/sensors"
+        with mock.patch("src.data.sensors.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="chip\nTemp:\n  temp1_input: broken\n")):
+            monitor.get_readings()
+        self.assertIn("malformada", monitor.errors["sensors"])
+
+    def test_chip_with_only_fans_is_not_a_command_failure(self):
+        with mock.patch("shutil.which", return_value="/usr/bin/sensors"):
+            monitor = SensorMonitor()
+        with mock.patch("src.data.sensors.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="chip\nfan1:\n  fan1_input: 1200\n")):
+            self.assertEqual(monitor.get_readings(), [])
+        self.assertEqual(monitor.errors, {})
+
+    def test_partial_temperature_parse_reports_missing_reading(self):
+        with mock.patch("shutil.which", return_value="/usr/bin/sensors"):
+            monitor = SensorMonitor()
+        with mock.patch("src.data.sensors.subprocess.run", return_value=SimpleNamespace(
+            returncode=0, stdout="chip\nTemp:\n  temp1_input: 35\n  temp2_input: broken\n"
+        )):
+            self.assertEqual(len(monitor.get_readings()), 1)
+        self.assertIn("malformada", monitor.errors["sensors"])
 
 
 if __name__ == "__main__":

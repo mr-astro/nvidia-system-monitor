@@ -1,7 +1,7 @@
 """NVIDIA GPU monitoring via nvidia-smi.
 
 All metrics are optional. The module never raises merely because NVIDIA, the
-driver or nvidia-smi is unavailable: it returns an empty list instead.
+driver or nvidia-smi is unavailable: it returns an empty list and diagnostics.
 """
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Optional
+
+from src.data.errors import command_error
 
 ND = "N/D"
 _MISSING = {
@@ -60,6 +62,7 @@ class NvidiaMonitor:
         self._cuda: Optional[str] = None
         self._cuda_tried_at: Optional[float] = None
         self._cuda_retry = cuda_retry_seconds
+        self.errors = {}
 
     @property
     def available(self) -> bool:
@@ -79,7 +82,10 @@ class NvidiaMonitor:
         return ND if value.upper() in _MISSING else value
 
     def _run(self, args: list) -> str:
+        key = "gpu" if args else "cuda"
+        self.errors.pop(key, None)
         if not self._binary:
+            self.errors[key] = "nvidia-smi: utilidad no disponible"
             return ""
         try:
             result = subprocess.run(
@@ -89,9 +95,13 @@ class NvidiaMonitor:
                 timeout=self.timeout,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.errors[key] = command_error("nvidia-smi", exception=exc)
             return ""
-        return result.stdout.strip() if result.returncode == 0 else ""
+        if result.returncode != 0:
+            self.errors[key] = command_error("nvidia-smi", result=result)
+            return ""
+        return result.stdout.strip()
 
     @classmethod
     def parse_query_output(cls, text: str) -> list:
@@ -133,12 +143,25 @@ class NvidiaMonitor:
     def get_metrics(self) -> list:
         """One list entry per GPU; empty when nvidia-smi is missing or fails."""
         if not self.available:
+            self.errors["gpu"] = "nvidia-smi: utilidad no disponible"
             return []
         text = self._run([
             f"--query-gpu={','.join(self.FIELDS)}",
             "--format=csv,noheader,nounits",
         ])
-        return self.parse_query_output(text) if text else []
+        metrics = self.parse_query_output(text) if text else []
+        malformed = not metrics or len(metrics) != len(text.splitlines())
+        for row in csv.reader(io.StringIO(text), skipinitialspace=True):
+            if len(row) < len(self.FIELDS):
+                malformed = True
+                continue
+            for value in [row[0], *row[-11:-1]]:
+                token = value.strip().upper()
+                if "UNKNOWN ERROR" in token or (token not in _MISSING and not _NUMBER.fullmatch(value.strip())):
+                    malformed = True
+        if "gpu" not in self.errors and malformed:
+            self.errors["gpu"] = "nvidia-smi: respuesta de métricas vacía o malformada"
+        return metrics
 
     @staticmethod
     def parse_cuda_version(banner: str) -> str:
@@ -157,5 +180,8 @@ class NvidiaMonitor:
         self._cuda_tried_at = now
         version = self.parse_cuda_version(self._run([]))
         if version != ND:
+            self.errors.pop("cuda", None)
             self._cuda = version
+        elif "cuda" not in self.errors:
+            self.errors["cuda"] = "nvidia-smi: versión CUDA no disponible en la respuesta"
         return version
