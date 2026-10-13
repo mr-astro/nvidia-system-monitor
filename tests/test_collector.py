@@ -96,6 +96,30 @@ class CollectOnce(unittest.TestCase):
         self.assertEqual(sensors.calls, 2)
         self.assertEqual(snap.sensors, ["reading"])
 
+    def test_udisks_errors_and_ages_persist_then_recover_and_disappear(self):
+        storage = SimpleNamespace(
+            errors={'udisks:sda': 'bus timeout'},
+            sources={'udisks:sda': SourceState(1, 1, 752, 'bus timeout')},
+            get_metrics=mock.Mock(return_value=[]),
+        )
+        now = [10.0]
+        collector = Collector(storage=storage, cpu=Cpu(), clock=lambda: now[0])
+        first = collector.collect_once()
+        now[0] = 20
+        second = collector.collect_once()
+        self.assertEqual(first.errors['udisks:sda'], second.errors['udisks:sda'])
+        self.assertEqual(second.sources['udisks:sda'].age(20), 19)
+        self.assertIsNotNone(second.cpu)
+        storage.errors = {}
+        storage.sources['udisks:sda'] = SourceState(1, 1, 752)
+        recovered = collector.collect_once()
+        self.assertNotIn('udisks:sda', recovered.errors)
+        self.assertEqual(recovered.sources['udisks:sda'].acquired_at, 1)
+        storage.sources = {}
+        removed = collector.collect_once()
+        self.assertNotIn('udisks:sda', removed.sources)
+        self.assertNotIn('udisks:sda', removed.errors)
+
 
 class ErrorLogging(unittest.TestCase):
     def test_repeated_error_is_logged_once_per_minute(self):

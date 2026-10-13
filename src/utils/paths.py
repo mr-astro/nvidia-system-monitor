@@ -21,3 +21,8 @@ def config_dir() -> Path:
 
 def state_dir() -> Path:
     return _xdg("XDG_STATE_HOME", Path.home() / ".local" / "state") / APP_DIRNAME
+
+
+def dev_config_dir() -> Path:
+    """Development preferences never overwrite the stable installation."""
+    return _xdg("XDG_CONFIG_HOME", Path.home() / ".config") / (APP_DIRNAME + "-dev")

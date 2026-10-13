@@ -3,10 +3,12 @@ import tempfile
 import types
 import unittest
 import subprocess
+import json
 from unittest import mock
 
 from src.data.storage import StorageMonitor
-from src.data.errors import freshness
+from src.data.errors import SourceState, freshness
+from src.data.udisks import TemperatureReading
 
 LSBLK = {"blockdevices": [
     {"name": "zram0", "type": "disk", "size": 8589934592, "model": None, "tran": None,
@@ -39,6 +41,7 @@ SCSI = "Current Drive Temperature:     30 C\n"
 
 
 def fake_monitor(**kwargs):
+    kwargs.setdefault("udisks", False)
     with mock.patch("shutil.which", return_value=None):
         return StorageMonitor(**kwargs)
 
@@ -365,7 +368,128 @@ class StorageReliability(unittest.TestCase):
         self.assertEqual(mounts["/mnt data"][-1], "/dev/mapper/vg-lv")
 
 
+class TemperatureSelection(unittest.TestCase):
+    def setUp(self):
+        self.now = [100.0]
+        self.reading = TemperatureReading(40, SourceState(95, 95, 752))
+        self.provider = types.SimpleNamespace(read=mock.Mock(side_effect=lambda name: self.reading))
+        self.monitor = fake_monitor(udisks=self.provider, clock=lambda: self.now[0], sys_dir='/nonexistent')
+        self.monitor._smartctl = '/usr/bin/smartctl'
+
+    def test_udisks_valid_avoids_smartctl_and_preserves_permission_diagnostic(self):
+        self.monitor.sources['smart:sda'] = SourceState(max_age=15, error='Permission denied')
+        self.monitor.errors['smart:sda'] = 'Permission denied'
+        with mock.patch('src.data.storage.subprocess.run') as run:
+            self.assertEqual(self.monitor._temperature('sda'), 40)
+        run.assert_not_called()
+        self.assertEqual(self.monitor._temperature_sources['sda'], 'udisks:sda')
+        self.assertIn('Permission denied', self.monitor.errors['smart:sda'])
+        self.assertEqual(self.monitor.sources['udisks:sda'].acquired_at, 95)
+
+    def test_new_udisks_reading_updates_value_without_pairing_old_value_with_new_time(self):
+        self.assertEqual(self.monitor._temperature('sda'), 40)
+        self.now[0] = 110
+        self.reading = TemperatureReading(42, SourceState(110, 110, 752))
+        self.assertEqual(self.monitor._temperature('sda'), 42)
+        self.assertEqual(self.monitor.sources['udisks:sda'].acquired_at, 110)
+
+    def test_udisks_expiring_during_dbus_call_still_evaluates_fallback(self):
+        self.now[0] = 4
+
+        def delayed(name):
+            self.now[0] = 6
+            return TemperatureReading(40, SourceState(0, 0, 5))
+
+        self.provider.read.side_effect = delayed
+        with mock.patch('src.data.storage.subprocess.run', return_value=types.SimpleNamespace(returncode=0, stdout=ATA)) as run:
+            self.assertEqual(self.monitor._temperature('sda'), 38)
+        run.assert_called_once()
+        self.assertEqual(self.monitor._temperature_sources['sda'], 'smart:sda')
+
+    def test_stale_and_unavailable_udisks_use_recent_smart(self):
+        for reading in (TemperatureReading(40, SourceState(-700, -700, 752)),
+                        TemperatureReading(None, SourceState(error='bus unavailable')),
+                        TemperatureReading(40, SourceState(95, 95, 752, 'bus failed'))):
+            with self.subTest(reading=reading):
+                self.reading = reading
+                with mock.patch('src.data.storage.subprocess.run', return_value=types.SimpleNamespace(returncode=0, stdout=ATA)):
+                    self.assertEqual(self.monitor._temperature('sda'), 38)
+                self.assertEqual(self.monitor._temperature_sources['sda'], 'smart:sda')
+
+    def test_valid_older_preferred_source_does_not_replace_recent_smart_then_takes_over(self):
+        self.reading = TemperatureReading(None, SourceState(error='not available'))
+        with mock.patch('src.data.storage.subprocess.run', return_value=types.SimpleNamespace(returncode=0, stdout=ATA)):
+            self.assertEqual(self.monitor._temperature('sda'), 38)
+        self.now[0] = 101
+        self.reading = TemperatureReading(40, SourceState(90, 90, 752))
+        with mock.patch('src.data.storage.subprocess.run') as run:
+            self.assertEqual(self.monitor._temperature('sda'), 38)
+            self.now[0] = 116
+            self.assertEqual(self.monitor._temperature('sda'), 40)
+        run.assert_not_called()
+        self.assertEqual(self.monitor._temperature_sources['sda'], 'udisks:sda')
+
+    def test_sysfs_priority_and_failure_does_not_rejuvenate_last_measurement(self):
+        with mock.patch.object(self.monitor, '_drivetemp_temperature', return_value=45):
+            self.assertEqual(self.monitor._temperature('sda'), 45)
+        self.provider.read.assert_not_called()
+        self.now[0] = 101
+        self.assertEqual(self.monitor._temperature('sda'), 45)
+        self.assertEqual(self.monitor.sources['temperature:sda'].acquired_at, 100)
+        self.assertIn('temperature:sda', self.monitor.errors)
+        self.now[0] = 103
+        self.assertEqual(self.monitor._temperature('sda'), 40)
+        with mock.patch.object(self.monitor, '_drivetemp_temperature', return_value=46):
+            self.assertEqual(self.monitor._temperature('sda'), 46)
+        self.assertNotIn('temperature:sda', self.monitor.errors)
+
+    def test_invalidated_udisks_identity_discards_previous_temperature(self):
+        self.assertEqual(self.monitor._temperature('sda'), 40)
+        self.reading = TemperatureReading(None, SourceState(error='identity changed'))
+        self.monitor._smartctl = None
+        self.assertIsNone(self.monitor._temperature('sda'))
+
+    def test_all_expired_sources_preserve_age_and_finite_last_value_for_diagnostic(self):
+        self.reading = TemperatureReading(40, SourceState(-700, -700, 752))
+        self.monitor._smartctl = None
+        self.assertEqual(self.monitor._temperature('sda'), 40)
+        self.assertTrue(self.monitor.sources['udisks:sda'].stale(100))
+        self.assertEqual(self.monitor.sources['udisks:sda'].age(100), 800)
+        self.assertNotIn('smart:sda', self.monitor.sources)
+
+    def test_disk_metrics_publish_selected_source_and_prune_disappeared_states(self):
+        nodes = [{'name': 'sda', 'type': 'disk', 'tran': 'sata'}]
+        with mock.patch.object(self.monitor, '_run_lsblk', return_value=nodes), \
+                mock.patch.object(self.monitor, '_read_mountinfo', return_value={}):
+            disk, = self.monitor.get_metrics()
+        self.assertEqual(disk.temperature_source, 'udisks:sda')
+        self.now[0] += 20
+        with mock.patch.object(self.monitor, '_run_lsblk', return_value=[]), \
+                mock.patch.object(self.monitor, '_read_mountinfo', return_value={}):
+            self.assertEqual(self.monitor.get_metrics(), [])
+        self.assertNotIn('udisks:sda', self.monitor.sources)
+        self.assertNotIn('sda', self.monitor._selected_temperatures)
+
+
 class StorageCommandFailures(unittest.TestCase):
+    def test_labels_use_existing_lsblk_query_and_preserve_missing_values(self):
+        monitor = fake_monitor(clock=lambda: 10.0)
+        monitor._lsblk = '/usr/bin/lsblk'
+        output = {'blockdevices': [{'name': 'sda', 'type': 'disk', 'children': [
+            {'name': 'sda1', 'fstype': 'ext4', 'label': ' Datos '},
+            {'name': 'sda2', 'fstype': 'ntfs', 'label': None},
+            {'name': 'sda3', 'fstype': 'btrfs'},
+        ]}]}
+        result = types.SimpleNamespace(returncode=0, stdout=json.dumps(output))
+        with mock.patch.object(monitor, '_read_mountinfo', return_value={}), mock.patch.object(
+            monitor, '_temperature', return_value=None
+        ), mock.patch('src.data.storage.subprocess.run', return_value=result) as run:
+            disk, = monitor.get_metrics()
+        self.assertEqual([part.label for part in disk.partitions], ['Datos', None, None])
+        self.assertIn('LABEL', run.call_args.args[0][-1].split(','))
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(monitor.sources['topology'].acquired_at, 10)
+
     def test_lsblk_errors_missing_binary_and_malformed_json(self):
         monitor = fake_monitor()
         self.assertIsNone(monitor._run_lsblk())

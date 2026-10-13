@@ -10,7 +10,7 @@ try:
 
     gi.require_version("Gtk", "4.0")
     gi.require_version("Gdk", "4.0")
-    from gi.repository import Gdk, Gtk
+    from gi.repository import Gdk, GLib, Gtk
 
     HAVE_GTK = bool(Gtk.init_check()) and Gdk.Display.get_default() is not None
 except (ImportError, ValueError):
@@ -61,6 +61,8 @@ class GuiSmoke(unittest.TestCase):
         import json
         path.write_text(json.dumps({"logging_enabled": False, **overrides}))
         app = SystemMonitorApp(Config(path))
+        from src.utils.disk_aliases import DiskAliasResolver
+        app.disk_aliases = DiskAliasResolver(Path(tmp.name) / "aliases.json", Path(tmp.name) / "by-id")
         # Each fixture exports its own D-Bus object, including when the host
         # already has the real monitor open. Keep the production ID unchanged.
         app.set_application_id(f"cl.mastro.NvidiaSystemMonitor.Test{next(self._application_ids)}")
@@ -145,12 +147,121 @@ class GuiSmoke(unittest.TestCase):
         self.assertFalse(self._app(theme="system").dark)
         self.assertTrue(self._app().dark)
 
-    def test_storage_is_full_width_and_cards_are_in_two_columns(self):
+    def test_storage_shares_the_gpu_column_and_ram_shares_the_cpu_column(self):
         app = self._app()
         cpu, ram, gpu, storage = (app.cards[n] for n in ("cpu", "ram", "gpu", "storage"))
         self.assertIs(cpu.get_parent(), ram.get_parent())       # left column
         self.assertIsNot(cpu.get_parent(), gpu.get_parent())    # right column
-        self.assertIs(cpu.get_parent().get_parent().get_parent(), storage.get_parent())
+        self.assertIs(gpu.get_parent(), storage.get_parent())
+        self.assertIsInstance(cpu.get_parent().get_parent().get_parent(), Gtk.FlowBox)
+
+    def _resize(self, app, width, height=720):
+        app.window.set_default_size(width, height)
+        app.window.present()
+        loop = GLib.MainLoop()
+        deadline = GLib.get_monotonic_time() + 2_000_000
+        settled = 0
+
+        def check_allocation():
+            nonlocal settled
+            size = (app.window.get_width(), app.window.get_height())
+            settled = settled + 1 if size == (width, height) else 0
+            if settled >= 2 or GLib.get_monotonic_time() >= deadline:
+                loop.quit()
+                return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_CONTINUE
+
+        GLib.timeout_add(20, check_allocation)
+        loop.run()
+        self.assertEqual(app.window.get_width(), width)
+        self.assertEqual(app.window.get_height(), height)
+
+    def _bounds(self, widget, relative):
+        success, bounds = widget.compute_bounds(relative)
+        self.assertTrue(success)
+        return bounds
+
+    def test_responsive_layout_reflows_without_recreating_cards_or_expanders(self):
+        app = self._app()
+        snap = full_snapshot()
+        snap.sources['usage:nvme0n1p2'] = SourceState(0, 0, 20)
+        snap.disks.extend([DiskMetrics('sda', model='KINGSTON SA400S37480G'), DiskMetrics('sdb')])
+        with mock.patch('src.gui.app.time.monotonic', return_value=1):
+            app._render(snap)
+        storage = app.cards['storage']
+        disk = next(iter(storage.disk_cards.values()))
+        self.assertTrue(all(not c.expander.get_expanded() for c in storage.disk_cards.values()))
+        cards = dict(app.cards)
+        row = next(iter(disk.partition_rows.values()))
+        bar = disk.usage_bar
+        left, right = app.cards['cpu'].get_parent(), app.cards['gpu'].get_parent()
+        columns = left.get_parent().get_parent()
+        scroller = columns.get_ancestor(Gtk.ScrolledWindow)
+
+        self._resize(app, 1000)
+        wide_left, wide_right = self._bounds(left, columns), self._bounds(right, columns)
+        self.assertAlmostEqual(wide_left.get_y(), wide_right.get_y(), delta=1)
+        self.assertGreater(wide_right.get_x(), wide_left.get_x())
+        self.assertLess(self._bounds(storage, scroller).get_y(), scroller.get_height())
+        self.assertLess(self._bounds(storage, columns).get_y(), wide_left.get_height())
+
+        disk.expander.set_expanded(True)
+        for width, height in ((480, 720), (380, 320), (1000, 720)):
+            self._resize(app, width, height)
+            left_bounds, right_bounds = self._bounds(left, columns), self._bounds(right, columns)
+            if width < 700:
+                self.assertAlmostEqual(left_bounds.get_x(), right_bounds.get_x(), delta=1)
+                self.assertGreaterEqual(right_bounds.get_y(), left_bounds.get_y() + left_bounds.get_height())
+                self.assertLessEqual(right_bounds.get_y() - left_bounds.get_height(), 13)
+                vertical = scroller.get_vadjustment()
+                self.assertGreater(vertical.get_upper(), vertical.get_page_size())
+            else:
+                self.assertAlmostEqual(left_bounds.get_y(), right_bounds.get_y(), delta=1)
+                self.assertGreater(right_bounds.get_x(), left_bounds.get_x())
+            horizontal = scroller.get_hadjustment()
+            self.assertLessEqual(horizontal.get_upper(), horizontal.get_page_size() + 1)
+            snap.sequence += 1
+            with mock.patch('src.gui.app.time.monotonic', return_value=1):
+                app._render(snap)
+            self.assertEqual(app.cards, cards)
+            self.assertIs(next(iter(storage.disk_cards.values())), disk)
+            self.assertIs(next(iter(disk.partition_rows.values())), row)
+            self.assertIs(disk.usage_bar, bar)
+            self.assertTrue(disk.expander.get_expanded())
+            self.assertTrue(bar.get_visible())
+            self.assertIs(left, app.cards['cpu'].get_parent())
+            self.assertIs(right, storage.get_parent())
+
+    def test_long_names_diagnostics_and_temperature_ages_fit_a_narrow_window(self):
+        app = self._app(panels={'sensors': True})
+        snap = full_snapshot()
+        snap.cpu.model = 'CPU_' + 'x' * 300
+        snap.gpus[0].name = 'GPU_' + 'x' * 300
+        snap.sensors = [SensorReading('sensor_' + 'x' * 300, 'label_' + 'x' * 300, 42)]
+        snap.disks[0].model = 'DISK_' + 'x' * 300
+        snap.disks[0].temperature_source = 'udisks:nvme0n1'
+        snap.sources['udisks:nvme0n1'] = SourceState(0, 0, 1000)
+        snap.errors = {'smart:nvme0n1': 'Permission denied ' + 'x' * 300}
+        with mock.patch('src.gui.app.time.monotonic', return_value=296):
+            app._render(snap)
+            app._update_status(snap)
+        self._resize(app, 380)
+        for card in app.cards.values():
+            self.assertLessEqual(card.measure(Gtk.Orientation.HORIZONTAL, -1)[0], card.get_width())
+        disk = next(iter(app.cards['storage'].disk_cards.values()))
+        self.assertIn('hace 296 s', disk.temperature.get_label())
+        self.assertIn('Permission denied', app.status.get_tooltip_text())
+        self.assertNotIn('Permission denied', app.status.get_label())
+
+    def test_one_enabled_column_uses_the_available_width_and_no_panels_still_fits(self):
+        for enabled in ('cpu', 'storage', None):
+            with self.subTest(enabled=enabled):
+                app = self._app(panels={name: name == enabled for name in ('cpu', 'gpu', 'ram', 'storage', 'sensors')})
+                app._render(full_snapshot())
+                self._resize(app, 380)
+                self.assertEqual(set(app.cards), {enabled} if enabled else set())
+                if enabled:
+                    self.assertGreater(app.cards[enabled].get_width(), 320)
 
     def test_fahrenheit(self):
         app = self._app(temperature_unit="F")
@@ -204,7 +315,8 @@ class GuiSmoke(unittest.TestCase):
             app._render(snap)
             self.assertIs(card._rows["state"][1], error_label)
             app._update_status(snap)
-            self.assertIn("interfaz:gpu", app.status.get_label())
+            self.assertIn("Interfaz · GPU", app.status.get_label())
+            self.assertIn("interfaz:gpu", app.status.get_tooltip_text())
             self.assertIn("failed after drawing", app.status.get_tooltip_text())
         self.assertIn("usage", app.cards["cpu"]._rows)
         snap.sequence = 4
@@ -212,7 +324,7 @@ class GuiSmoke(unittest.TestCase):
         app._update_status(snap)
         self.assertIn("gpu0:usage", app.cards["gpu"]._rows)
         self.assertNotIn("gpu", app._last_render_error)
-        self.assertNotIn("interfaz:gpu", app.status.get_label())
+        self.assertNotIn("Interfaz · GPU", app.status.get_label())
 
     def test_failure_before_render_also_invalidates_old_values(self):
         app = self._app()
@@ -231,7 +343,8 @@ class GuiSmoke(unittest.TestCase):
             "src.gui.app.time.monotonic", return_value=102
         ), mock.patch("src.gui.app.time.strftime", side_effect=AssertionError("wall clock used")):
             app._on_tick()
-            self.assertIn("hace 2 s", app.status.get_label())
+            self.assertEqual(app.status.get_label(), "Instantánea recibida hace 1 s")
+            self.assertIn("hace 2 s", app.cards["gpu"]._rows["freshness"][1].get_label())
             self.assertIn("gpu0:usage", app.cards["gpu"]._rows)
         with mock.patch.object(app.collector, "latest", return_value=snap), mock.patch(
             "src.gui.app.time.monotonic", return_value=105
@@ -258,17 +371,21 @@ class GuiSmoke(unittest.TestCase):
         with mock.patch("src.gui.app.time.monotonic", return_value=20):
             app._render(snap)
             app._update_status(snap)
-        rows = app.cards["storage"]._rows
-        self.assertIn("usados", rows["use:nvme0n1:nvme0n1p2"][1].get_label())
-        for key in ("topology-state", "temperature-state:nvme0n1", "usage-state:nvme0n1:nvme0n1p2"):
-            self.assertIn("Obsoleto", rows[key][1].get_label())
-            self.assertIn("hace 20 s", rows[key][1].get_label())
+        card = next(iter(app.cards["storage"].disk_cards.values()))
+        row = next(iter(card.partition_rows.values()))
+        self.assertIn("usados", row.usage.get_label())
+        self.assertIn("Datos obsoletos", card.status.get_label())
+        self.assertIn("hace 20 s", card.status.get_label())
+        self.assertIn("smart timeout", card.status.get_tooltip_text())
+        self.assertEqual(card.temperature.get_label(), "N/D")
+        self.assertIn("obsoleto", row.warning.get_label().lower())
         snap.disks[0].partitions[0].used_bytes = None
         snap.disks[0].partitions[0].usage_percent = None
         snap.sequence = 2
         with mock.patch("src.gui.app.time.monotonic", return_value=21):
             app._render(snap)
-        self.assertNotIn("use:nvme0n1:nvme0n1p2", app.cards["storage"]._rows)
+        self.assertFalse(row.usage.get_visible())
+        self.assertFalse(row.bar.get_visible())
 
     def test_independent_cadences_do_not_warn_during_normal_caches(self):
         app = self._app(panels={"sensors": True})
@@ -288,6 +405,79 @@ class GuiSmoke(unittest.TestCase):
         self.assertIn("s0", app.cards["sensors"]._rows)
         self.assertEqual(app._last_render_error, {})
 
+    def test_cached_smart_age_is_local_and_global_status_describes_snapshot_reception(self):
+        app = self._app()
+        snap = full_snapshot()
+        snap.timestamp = 999
+        snap.disks[0].temperature_source = 'smart:nvme0n1'
+        snap.sources = {
+            'cpu': SourceState(999, 999, freshness(1)),
+            'gpu': SourceState(999, 999, freshness(1, 2)),
+            'ram': SourceState(999, 999, freshness(1)),
+            'topology': SourceState(986, 986, freshness(15, 2)),
+            'smart:nvme0n1': SourceState(704, 704, 300),
+        }
+        states = dict(snap.sources)
+        with mock.patch('src.gui.app.time.monotonic', return_value=1000):
+            app._render(snap)
+            app._update_status(snap)
+        disk = next(iter(app.cards['storage'].disk_cards.values()))
+        self.assertIn('hace 296 s', disk.temperature.get_label())
+        self.assertEqual(app.status.get_label(), 'Instantánea recibida hace 1 s')
+        self.assertIn('SMART · nvme0n1 (smart:nvme0n1): Medido · hace 296 s', app.status.get_tooltip_text())
+        self.assertEqual(snap.sources, states)
+
+        snap.timestamp = 1005
+        for key in ('cpu', 'gpu', 'ram'):
+            snap.sources[key] = SourceState(1005, 1005, snap.sources[key].max_age)
+        with mock.patch('src.gui.app.time.monotonic', return_value=1005):
+            app._render(snap)
+            app._update_status(snap)
+        self.assertEqual(app.status.get_label(), 'Avisos: SMART · nvme0n1')
+        self.assertIn('Obsoleto · hace 301 s', app.status.get_tooltip_text())
+        self.assertEqual(disk.temperature.get_label(), 'N/D')
+        self.assertIn('hace 301 s', disk.status.get_label())
+        self.assertIs(snap.sources['smart:nvme0n1'], states['smart:nvme0n1'])
+
+    def test_global_warnings_identify_each_source_and_preserve_technical_details(self):
+        app = self._app()
+        snap = full_snapshot()
+        snap.timestamp = 100
+        snap.errors = {'smart:sda': 'Permission denied', 'udisks:sdb': 'D-Bus error',
+                       'usage:dm-0': 'statvfs failed', 'topology': 'lsblk timeout',
+                       'temperature:nvme0n1': 'sysfs failed', 'cuda': 'query failed'}
+        app._last_render_error['gpu'] = 'render failed'
+        with mock.patch('src.gui.app.time.monotonic', return_value=101):
+            app._update_status(snap)
+        for title in ('SMART · sda', 'Temperatura UDisks2 · sdb', 'Uso · dm-0',
+                      'Topología de almacenamiento', 'Temperatura · nvme0n1',
+                      'NVIDIA/CUDA', 'Interfaz · GPU'):
+            self.assertIn(title, app.status.get_label())
+        for key, error in snap.errors.items():
+            self.assertIn(f'({key}): {error}', app.status.get_tooltip_text())
+
+    def test_delayed_publication_is_distinguished_from_cached_measurement_age(self):
+        app = self._app()
+        snap = full_snapshot()
+        snap.timestamp = 100
+        snap.sources = {'smart:nvme0n1': SourceState(0, 0, 300)}
+        with mock.patch('src.gui.app.time.monotonic', return_value=111):
+            app._update_status(snap)
+        self.assertEqual(app.status.get_label(), 'Sin instantáneas recientes')
+        self.assertIn('Instantánea recibida hace 11 s', app.status.get_tooltip_text())
+        self.assertIn('SMART · nvme0n1 (smart:nvme0n1): Medido · hace 111 s', app.status.get_tooltip_text())
+        self.assertNotIn('Obsoleto', app.status.get_tooltip_text())
+
+    def test_snapshot_with_no_successful_measurement_keeps_its_unavailable_status(self):
+        app = self._app()
+        snap = full_snapshot()
+        snap.timestamp = 100
+        snap.sources = {'cpu': SourceState(), 'gpu': SourceState()}
+        with mock.patch('src.gui.app.time.monotonic', return_value=101):
+            app._update_status(snap)
+        self.assertEqual(app.status.get_label(), 'Sin mediciones válidas')
+        self.assertIn('CPU (cpu): Sin medición válida', app.status.get_tooltip_text())
+
     def test_sensor_warning_persists_and_valid_render_recovers(self):
         app = self._app(panels={"sensors": True})
         snap = full_snapshot()
@@ -297,7 +487,8 @@ class GuiSmoke(unittest.TestCase):
             app._render(snap)
             app._update_status(snap)
         self.assertEqual(set(app.cards["sensors"]._rows), {"state"})
-        self.assertIn("sensors", app.status.get_label())
+        self.assertIn("Sensores", app.status.get_label())
+        self.assertIn("sensors", app.status.get_tooltip_text())
         snap.sources = {"sensors": SourceState(10, 10, freshness(5, 2))}
         snap.errors = {}
         snap.sequence = 2
@@ -306,6 +497,48 @@ class GuiSmoke(unittest.TestCase):
             app._update_status(snap)
         self.assertIn("s0", app.cards["sensors"]._rows)
         self.assertNotIn("Avisos", app.status.get_label())
+
+    def test_storage_render_failure_recovery_keeps_expansion_and_error_signature(self):
+        app = self._app()
+        snap = full_snapshot()
+        app._render(snap)
+        panel = app.cards['storage']
+        next(iter(panel.disk_cards.values())).expander.set_expanded(True)
+        original = app._render_storage
+
+        def broken(card, snapshot):
+            original(card, snapshot)
+            raise RuntimeError('storage render failed')
+
+        snap.sequence = 2
+        with mock.patch.object(app, '_render_storage', side_effect=broken):
+            app._render(snap)
+            self.assertFalse(panel.disk_cards)
+            error_label = panel._rows['state'][1]
+            snap.sequence = 3
+            app._render(snap)
+            self.assertIs(error_label, panel._rows['state'][1])
+        snap.sequence = 4
+        app._render(snap)
+        self.assertTrue(next(iter(panel.disk_cards.values())).expander.get_expanded())
+        self.assertNotIn('storage', app._last_render_error)
+
+    def test_default_dev_config_and_application_id_are_independent(self):
+        from src.gui.app import SystemMonitorApp
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict('os.environ', {'XDG_CONFIG_HOME': temporary}):
+            root = Path(temporary)
+            stable = root / 'nvidia-system-monitor'
+            dev = root / 'nvidia-system-monitor-dev'
+            stable.mkdir()
+            dev.mkdir()
+            stable_text = '{"refresh_interval_seconds": 1, "logging_enabled": false}'
+            (stable / 'config.json').write_text(stable_text)
+            (dev / 'config.json').write_text('{"refresh_interval_seconds": 3, "logging_enabled": false}')
+            app = SystemMonitorApp()
+            self.assertEqual(app.interval, 3)
+            self.assertEqual(app.config.path, dev / 'config.json')
+            self.assertTrue(app.get_application_id().endswith('.Dev'))
+            self.assertEqual((stable / 'config.json').read_text(), stable_text)
 
 
 if __name__ == "__main__":

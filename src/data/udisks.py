@@ -1,0 +1,150 @@
+"""Optional, read-only UDisks2 SMART temperatures through Gio's system D-Bus.
+
+No SMART update, device operation or authentication is requested. One bounded
+ObjectManager read serves all disks; SMART age is independent of that read.
+"""
+from __future__ import annotations
+
+import math
+import re
+import threading
+import time
+from dataclasses import dataclass, replace
+
+from src.data.errors import SourceState, freshness
+
+BLOCK = "org.freedesktop.UDisks2.Block"
+ATA = "org.freedesktop.UDisks2.Drive.Ata"
+SERVICE = "org.freedesktop.UDisks2"
+ROOT = "/org/freedesktop/UDisks2"
+_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+@dataclass(frozen=True)
+class TemperatureReading:
+    value: float | None
+    state: SourceState
+
+
+class UDisksTemperature:
+    def __init__(self, timeout=2.0, poll_interval=10.0, failure_backoff=300.0,
+                 smart_interval=600.0, clock=time.monotonic, wall_clock=time.time,
+                 fetch=None):
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+        self.failure_backoff = failure_backoff
+        self.max_age = freshness(smart_interval, timeout)
+        self._clock, self._wall_clock = clock, wall_clock
+        self._fetch = fetch or self._managed_objects
+        self._connection = None
+        self._next_read = None
+        self._objects = {}
+        self._error = None
+        # Device -> (persistent identity, SmartUpdated, reading).
+        self._samples = {}
+
+    def _managed_objects(self):
+        # Lazy import keeps this optional source usable without GUI imports.
+        from gi.repository import Gio, GLib
+
+        cancel = Gio.Cancellable()
+        timer = threading.Timer(self.timeout, cancel.cancel)
+        timer.daemon = True
+        started = time.monotonic()
+        timer.start()
+        try:
+            if self._connection is None or self._connection.is_closed():
+                address = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SYSTEM, cancel)
+                self._connection = Gio.DBusConnection.new_for_address_sync(
+                    address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                    | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, cancel,
+                )
+                self._connection.set_exit_on_close(False)
+            remaining = self.timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("tiempo límite de conexión D-Bus")
+            response = self._connection.call_sync(
+                SERVICE, ROOT, "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
+                None, GLib.VariantType.new("(a{oa{sa{sv}}})"),
+                Gio.DBusCallFlags.NO_AUTO_START, max(1, int(remaining * 1000)), cancel,
+            )
+            return response.unpack()[0]
+        finally:
+            timer.cancel()
+
+    def _refresh(self):
+        now = self._clock()
+        if self._next_read is not None and now < self._next_read:
+            return
+        try:
+            objects = self._fetch()
+            if not isinstance(objects, dict) or any(
+                not isinstance(path, str) or not isinstance(interfaces, dict)
+                or any(not isinstance(properties, dict) for properties in interfaces.values())
+                for path, interfaces in objects.items()
+            ):
+                raise ValueError("respuesta ObjectManager malformada")
+        except Exception as exc:
+            self._error = f"UDisks2: {type(exc).__name__}: {str(exc)[:400]}"
+            self._next_read = self._clock() + self.failure_backoff
+        else:
+            self._objects = objects
+            self._error = None
+            self._next_read = self._clock() + self.poll_interval
+
+    def _unavailable(self, name, error, retain=True):
+        previous = self._samples.get(name) if retain else None
+        reading = previous[2] if previous else TemperatureReading(None, SourceState(max_age=self.max_age))
+        return TemperatureReading(reading.value, replace(reading.state, error=error))
+
+    def read(self, name):
+        if not isinstance(name, str) or not _NAME.fullmatch(name):
+            return self._unavailable(name, "UDisks2: nombre de dispositivo no válido", retain=False)
+        self._refresh()
+        if self._error:
+            return self._unavailable(name, self._error)
+        matches = []
+        for interfaces in self._objects.values():
+            block = interfaces.get(BLOCK, {})
+            raw_device = block.get("Device", [])
+            if not isinstance(raw_device, (bytes, bytearray, list, tuple)):
+                continue
+            try:
+                device = bytes(raw_device).rstrip(b"\0").decode("utf-8")
+            except (TypeError, ValueError, UnicodeError):
+                continue
+            # Match a whole-disk object, never an adjacent partition or mapper.
+            if device == "/dev/" + name and "org.freedesktop.UDisks2.Partition" not in interfaces:
+                matches.append(block)
+        if len(matches) != 1:
+            self._samples.pop(name, None)
+            return self._unavailable(name, "UDisks2: dispositivo ausente o identidad ambigua", retain=False)
+        block = matches[0]
+        drive = block.get("Drive")
+        identity = (block.get("Id"), drive)
+        if not isinstance(identity[0], str) or not identity[0] or not isinstance(drive, str) or drive == "/":
+            self._samples.pop(name, None)
+            return self._unavailable(name, "UDisks2: identidad física no verificable", retain=False)
+        previous = self._samples.get(name)
+        if previous and previous[0] != identity:
+            self._samples.pop(name)
+            previous = None
+        ata = self._objects.get(drive, {}).get(ATA, {})
+        if ata.get("SmartSupported") is not True or ata.get("SmartEnabled") is not True:
+            return self._unavailable(name, "UDisks2: SMART no disponible o deshabilitado")
+        updated, kelvin = ata.get("SmartUpdated"), ata.get("SmartTemperature")
+        wall = self._wall_clock()
+        if (isinstance(updated, bool) or not isinstance(updated, int) or updated <= 0
+                or (updated > wall + 1 and not (previous and updated == previous[1])) or isinstance(kelvin, bool)
+                or not isinstance(kelvin, (int, float)) or not math.isfinite(kelvin)
+                or kelvin <= 0):
+            return self._unavailable(name, "UDisks2: temperatura o SmartUpdated no válidos")
+        if previous and updated < previous[1]:
+            return self._unavailable(name, "UDisks2: SmartUpdated retrocedió")
+        # Anchor once per actual SMART measurement, never once per D-Bus read.
+        measured = previous[2].state.acquired_at if previous and updated == previous[1] else (
+            self._clock() - max(0.0, wall - updated)
+        )
+        reading = TemperatureReading(kelvin - 273.15, SourceState(measured, measured, self.max_age))
+        self._samples[name] = (identity, updated, reading)
+        return reading

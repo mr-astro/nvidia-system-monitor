@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -16,13 +17,14 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from src.data.errors import SourceState, command_error, freshness
+from src.data.udisks import UDisksTemperature
 
 ND = "N/D"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _ATA_TEMP_ATTRIBUTES = {"Temperature_Celsius", "Airflow_Temperature_Cel", "Temperature_Internal"}
 _SIMPLE_TEMP = re.compile(r"(?:Temperature|Current Drive Temperature):\s*(\d+)\b")
 
-LSBLK_COLUMNS = "NAME,TYPE,SIZE,MODEL,TRAN,MOUNTPOINTS,ROTA,FSTYPE,MAJ:MIN"
+LSBLK_COLUMNS = "NAME,TYPE,SIZE,MODEL,TRAN,MOUNTPOINTS,ROTA,FSTYPE,MAJ:MIN,LABEL"
 # util-linux < 2.37 has no MOUNTPOINTS column.
 LSBLK_COLUMNS_LEGACY = LSBLK_COLUMNS.replace("MOUNTPOINTS", "MOUNTPOINT")
 
@@ -37,6 +39,7 @@ class PartitionMetrics:
     free_bytes: Optional[int] = None
     usage_percent: Optional[float] = None
     depth: int = 1
+    label: Optional[str] = None
 
 
 @dataclass
@@ -48,6 +51,7 @@ class DiskMetrics:
     size_bytes: Optional[int] = None
     temperature_c: Optional[float] = None
     partitions: list = field(default_factory=list)
+    temperature_source: Optional[str] = None
 
 
 def _truthy(value) -> bool:
@@ -66,6 +70,7 @@ class StorageMonitor:
         sys_dir: str = "/sys",
         clock=time.monotonic,
         mountinfo_path="/proc/self/mountinfo",
+        udisks=None,
     ):
         self.timeout = timeout
         self.topology_interval = topology_interval
@@ -87,6 +92,12 @@ class StorageMonitor:
         self._mount_identities = {}
         self._usage_cache = {}
         self._valid_mounts = {}
+        self._udisks = UDisksTemperature(
+            timeout=timeout, poll_interval=temperature_interval,
+            failure_backoff=failure_backoff, clock=clock,
+        ) if udisks is None else udisks
+        self._selected_temperatures = {}
+        self._temperature_sources = {}
 
     # ---- topology -------------------------------------------------------
 
@@ -257,6 +268,7 @@ class StorageMonitor:
             mountpoints=[path for path in mounts if not path.startswith("/") or path in valid],
             used_bytes=values[0], free_bytes=values[1],
             usage_percent=values[2], depth=depth,
+            label=node["label"].strip() or None if isinstance(node.get("label"), str) else None,
         )
 
     def _flatten(self, nodes, depth: int = 1):
@@ -373,20 +385,74 @@ class StorageMonitor:
         started = self._clock()
         if name.startswith("nvme"):
             value = self._nvme_temperature(name)
-            if value is not None:
+            if value is not None and math.isfinite(value):
                 self.sources["temperature:" + name] = SourceState(started, self._clock(), freshness(self.refresh_interval))
                 self.sources.pop("smart:" + name, None)
                 self.errors.pop("smart:" + name, None)
+                self._temperature_sources[name] = "temperature:" + name
                 return value
         else:
             value = self._drivetemp_temperature(name)
-            if value is not None:
-                self.sources["temperature:" + name] = SourceState(started, self._clock(), freshness(self.refresh_interval))
-                self.sources.pop("smart:" + name, None)
-                self.errors.pop("smart:" + name, None)
+            if value is not None and math.isfinite(value):
+                key = "temperature:" + name
+                self.sources[key] = SourceState(started, self._clock(), freshness(self.refresh_interval))
+                self.errors.pop(key, None)
+                self._selected_temperatures[name] = (value, key)
+                self._temperature_sources[name] = key
                 return value
-        self.sources.pop("temperature:" + name, None)
-        return self._smart_temperature(name)
+        if name.startswith("nvme"):
+            self.sources.pop("temperature:" + name, None)
+            self._temperature_sources[name] = "smart:" + name
+            return self._smart_temperature(name)
+
+        sysfs_key = "temperature:" + name
+        if sysfs_key in self.sources:
+            old = self.sources[sysfs_key]
+            message = "Temperatura sysfs no disponible"
+            self.sources[sysfs_key] = SourceState(old.acquired_at, old.completed_at, old.max_age, message)
+            self.errors[sysfs_key] = message
+
+        candidates = {}
+        previous = self._selected_temperatures.get(name)
+        if previous and previous[1] in self.sources:
+            candidates[previous[1]] = previous[0]
+        udisks_key = "udisks:" + name
+        if self._udisks:
+            reading = self._udisks.read(name)
+            self.sources[udisks_key] = reading.state
+            if reading.state.error:
+                self.errors[udisks_key] = reading.state.error
+            else:
+                self.errors.pop(udisks_key, None)
+            if reading.value is not None:
+                candidates[udisks_key] = reading.value
+            udisks_valid = (reading.value is not None and math.isfinite(reading.value)
+                            and not reading.state.stale(self._clock()))
+        else:
+            udisks_valid = False
+        # An unavailable/expired preferred source must not suppress a fresh
+        # fallback. A successful preferred source avoids unnecessary commands.
+        if not udisks_valid:
+            value = self._smart_temperature(name)
+            if value is not None:
+                candidates["smart:" + name] = value
+        # Re-read states after attempts: a failure can preserve the value while
+        # changing its diagnostic, and never its original acquisition time.
+        candidates = [(value, key) for key, value in candidates.items()
+                      if math.isfinite(value) and key in self.sources
+                      and self.sources[key].acquired_at is not None]
+        recent = [(value, key) for value, key in candidates
+                  if self.sources[key].age(self._clock()) <= self.sources[key].max_age]
+        chosen = max(recent or candidates, key=lambda item: (
+            self.sources[item[1]].acquired_at, item[1].startswith("udisks:")
+        ), default=None)
+        if chosen:
+            self._selected_temperatures[name] = chosen
+            self._temperature_sources[name] = chosen[1]
+            return chosen[0]
+        self._selected_temperatures.pop(name, None)
+        self._temperature_sources[name] = udisks_key if self._udisks else "smart:" + name
+        return None
 
     # ---- public ---------------------------------------------------------
 
@@ -405,6 +471,7 @@ class StorageMonitor:
                 size_bytes=d.get("size"),
                 temperature_c=self._temperature(name),
                 partitions=list(self._flatten(d.get("children"))),
+                temperature_source=self._temperature_sources.get(name),
             ))
         return disks
 
@@ -444,8 +511,11 @@ class StorageMonitor:
         disks = self.build_metrics(self._topology)
         active = {"topology"}
         for disk in disks:
-            active.update(("temperature:" + disk.name, "smart:" + disk.name))
+            active.update(("temperature:" + disk.name, "smart:" + disk.name, "udisks:" + disk.name))
             active.update("usage:" + p.name for p in disk.partitions)
         self.sources = {k: v for k, v in self.sources.items() if k in active}
         self.errors = {k: v for k, v in self.errors.items() if k in active or k == "storage"}
+        names = {disk.name for disk in disks}
+        self._selected_temperatures = {k: v for k, v in self._selected_temperatures.items() if k in names}
+        self._temperature_sources = {k: v for k, v in self._temperature_sources.items() if k in names}
         return disks

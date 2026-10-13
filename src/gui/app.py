@@ -12,7 +12,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 from src.data.collector import Collector, Snapshot  # noqa: E402
 from src.data.cpu import CpuMonitor  # noqa: E402
@@ -20,13 +20,17 @@ from src.data.nvidia import NvidiaMonitor  # noqa: E402
 from src.data.ram import RamMonitor  # noqa: E402
 from src.data.sensors import SensorMonitor  # noqa: E402
 from src.data.storage import StorageMonitor  # noqa: E402
+from src.gui.widgets import MetricCard, _set_text
+from src.gui.storage import StoragePanel, STORAGE_CSS
+from src.utils.disk_aliases import DiskAliasResolver
+from src.utils.paths import dev_config_dir
 from src.utils.config import Config  # noqa: E402
 from src.utils.formatting import (  # noqa: E402
-    fmt, fmt_bytes, fmt_mb, fmt_temp, usage_level,
+    fmt, fmt_mb, fmt_temp, usage_level,
 )
 from src.utils.logger import setup_logging  # noqa: E402
 
-APP_ID = "cl.mastro.NvidiaSystemMonitor"
+APP_ID = "cl.mastro.NvidiaSystemMonitor.Dev"
 PANEL_ORDER = ("cpu", "gpu", "ram", "storage", "sensors")
 PANEL_TITLES = {
     "cpu": "CPU",
@@ -35,19 +39,19 @@ PANEL_TITLES = {
     "storage": "Almacenamiento",
     "sensors": "Sensores",
 }
-LEVEL_CLASSES = ("usage-low", "usage-medium", "usage-high")
 MAX_SENSOR_ROWS = 24
 
 
 LEFT_PANELS = ("cpu", "ram", "sensors")
-RIGHT_PANELS = ("gpu",)
-WIDE_PANELS = ("storage",)
+RIGHT_PANELS = ("gpu", "storage")
+MIN_COLUMN_WIDTH = 340
 
 _BASE_CSS = """
 .hw-heading, .hw-title {{ font-weight: 700; margin-bottom: 8px; }}
 .hw-card {{ padding: 12px; border-radius: 8px; }}
 .hw-key {{ font-size: 85%; }}
 .hw-value {{ font-size: 85%; font-weight: 500; font-feature-settings: "tnum"; }}
+.monitor-layout > flowboxchild {{ padding: 0; }}
 progressbar.hw-bar trough, progressbar.hw-bar progress {{ min-height: 6px; border-radius: 3px; }}
 progressbar.usage-low progress {{ background-image: none; background-color: {low}; }}
 progressbar.usage-medium progress {{ background-image: none; background-color: {medium}; }}
@@ -86,90 +90,14 @@ def build_css(colors: dict, dark: bool = True) -> str:
         medium=colors["medium_usage_color"],
         high=colors["high_usage_color"],
     )
-    return base + (_DARK_CSS if dark else _SYSTEM_CSS)
-
-
-def _set_text(label: Gtk.Label, text: str) -> None:
-    if label.get_label() != text:
-        label.set_label(text)
-
-
-class MetricCard(Gtk.Box):
-    """A titled card whose rows are created once and updated in place."""
-
-    def __init__(self, title: str):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.add_css_class("hw-card")
-        self.set_hexpand(True)
-        self.set_valign(Gtk.Align.START)
-
-        heading = Gtk.Label(label=title)
-        heading.set_xalign(0)
-        heading.add_css_class("hw-title")
-        self.append(heading)
-
-        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.append(self.body)
-
-        self._rows: dict = {}
-        self._signature = None
-
-    def reset(self, signature) -> None:
-        """Rebuild from scratch only when the card's structure changes."""
-        if signature == self._signature:
-            return
-        child = self.body.get_first_child()
-        while child is not None:
-            following = child.get_next_sibling()
-            self.body.remove(child)
-            child = following
-        self._rows.clear()
-        self._signature = signature
-
-    def _create_row(self, key: str, bar: bool):
-        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        key_label = Gtk.Label()
-        key_label.set_xalign(0)
-        key_label.set_hexpand(True)
-        key_label.add_css_class("hw-key")
-        value_label = Gtk.Label()
-        value_label.set_xalign(1)
-        value_label.set_wrap(True)
-        value_label.set_max_width_chars(44)
-        value_label.add_css_class("hw-value")
-        line.append(key_label)
-        line.append(value_label)
-        container.append(line)
-
-        progress = None
-        if bar:
-            progress = Gtk.ProgressBar()
-            progress.add_css_class("hw-bar")
-            container.append(progress)
-
-        self.body.append(container)
-        self._rows[key] = (key_label, value_label, progress)
-        return self._rows[key]
-
-    def set_row(self, key, label, value, percent=None, level=None, bar=False) -> None:
-        entry = self._rows.get(key) or self._create_row(key, bar)
-        key_label, value_label, progress = entry
-        _set_text(key_label, label)
-        _set_text(value_label, str(value))
-        if progress is not None:
-            fraction = 0.0 if percent is None else max(0.0, min(1.0, percent / 100.0))
-            progress.set_fraction(fraction)
-            for css_class in LEVEL_CLASSES:
-                progress.remove_css_class(css_class)
-            if level and percent is not None:
-                progress.add_css_class(f"usage-{level}")
+    return base + (_DARK_CSS if dark else _SYSTEM_CSS) + STORAGE_CSS
 
 
 class SystemMonitorApp(Gtk.Application):
     def __init__(self, config=None):
         super().__init__(application_id=APP_ID)
-        self.config = config or Config()
+        self.config = config or Config(dev_config_dir() / "config.json")
+        self.disk_aliases = DiskAliasResolver()
         self.logger = setup_logging(bool(self.config.get("logging_enabled", True)))
 
         panels = self.config.get("panels", {})
@@ -252,8 +180,10 @@ class SystemMonitorApp(Gtk.Application):
 
     def _build_window(self) -> None:
         self.window = Gtk.ApplicationWindow(application=self)
-        self.window.set_title("NVIDIA System Monitor")
-        self.window.set_default_size(1100, 880)
+        self.window.set_title("NVIDIA System Monitor DEV")
+        self.window.set_icon_name("cl.mastro.NvidiaSystemMonitor")
+        self.window.set_default_size(1000, 720)
+        self.window.set_size_request(380, 320)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         for setter in (root.set_margin_top, root.set_margin_bottom,
@@ -265,9 +195,13 @@ class SystemMonitorApp(Gtk.Application):
         title = Gtk.Label(label="Hardware Monitor")
         title.set_xalign(0)
         title.set_hexpand(True)
+        title.set_ellipsize(Pango.EllipsizeMode.END)
         title.add_css_class("hw-heading")
         header.append(title)
         self.status = Gtk.Label(label="Recopilando datos…")
+        self.status.set_xalign(1)
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        self.status.set_max_width_chars(40)
         header.append(self.status)
         root.append(header)
 
@@ -281,29 +215,42 @@ class SystemMonitorApp(Gtk.Application):
         scroller.set_child(content)
 
         if not self.enabled:
-            content.append(Gtk.Label(label="Ningún panel habilitado en la configuración."))
+            empty = Gtk.Label(label="Ningún panel habilitado en la configuración.")
+            empty.set_wrap(True)
+            content.append(empty)
 
-        # Two independent columns avoid the empty gaps a shared grid leaves when
-        # cards have different heights; storage is long, so it gets the full width.
-        columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        columns.set_homogeneous(True)
+        # GTK reflows the two independent groups using their minimum widths.
+        # Unequal row heights keep the single-column layout compact. Cards never
+        # leave their group, so resizing preserves their widgets and expanders.
+        columns = Gtk.FlowBox()
+        columns.add_css_class("monitor-layout")
+        columns.set_selection_mode(Gtk.SelectionMode.NONE)
+        columns.set_min_children_per_line(1)
+        columns.set_max_children_per_line(2)
+        columns.set_homogeneous(False)
+        columns.set_column_spacing(12)
+        columns.set_row_spacing(12)
+        columns.set_valign(Gtk.Align.START)
         for group in (LEFT_PANELS, RIGHT_PANELS):
             names = [n for n in group if n in self.enabled]
             if not names:
                 continue
             column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            column.set_hexpand(True)
             column.set_valign(Gtk.Align.START)
+            column.set_size_request(MIN_COLUMN_WIDTH, -1)
             for name in names:
-                self.cards[name] = MetricCard(PANEL_TITLES[name])
+                self.cards[name] = self._new_card(name)
                 column.append(self.cards[name])
             columns.append(column)
+            column.get_parent().set_focusable(False)
         if columns.get_first_child() is not None:
             content.append(columns)
 
-        for name in WIDE_PANELS:
-            if name in self.enabled:
-                self.cards[name] = MetricCard(PANEL_TITLES[name])
-                content.append(self.cards[name])
+    def _new_card(self, name):
+        if name == "storage":
+            return StoragePanel(self.disk_aliases, self.unit, self.medium, self.high)
+        return MetricCard(PANEL_TITLES[name])
 
     # ---- update loop ----------------------------------------------------
 
@@ -327,6 +274,21 @@ class SystemMonitorApp(Gtk.Application):
         prefix = "Obsoleto" if state.stale(now) else "Medido"
         return f"{prefix} · hace {age:.0f} s" + (f" · {state.error}" if state.error else "")
 
+    @staticmethod
+    def _source_title(key):
+        if key in PANEL_TITLES:
+            return PANEL_TITLES[key]
+        if key == "topology":
+            return "Topología de almacenamiento"
+        if key == "cuda":
+            return "NVIDIA/CUDA"
+        prefix, separator, device = key.partition(":")
+        names = {"smart": "SMART", "udisks": "Temperatura UDisks2",
+                 "temperature": "Temperatura", "usage": "Uso", "interfaz": "Interfaz"}
+        if separator and prefix in names:
+            return f"{names[prefix]} · {PANEL_TITLES.get(device, device)}"
+        return key
+
     def _update_status(self, snap: Snapshot) -> None:
         if not snap.sequence:
             return
@@ -334,19 +296,21 @@ class SystemMonitorApp(Gtk.Application):
         errors = dict(snap.errors)
         errors.update({f"interfaz:{k}": v for k, v in self._last_render_error.items()})
         stale = {k: v for k, v in snap.sources.items() if v.stale(now)}
-        details = [f"{k}: {v}" for k, v in errors.items()]
-        details.extend(f"{k}: {self._source_note(v, now)}" for k, v in stale.items())
+        received = f"Instantánea recibida hace {max(0, now - snap.timestamp):.0f} s"
+        details = [received]
+        details.extend(f"{self._source_title(k)} ({k}): {v}" for k, v in errors.items())
+        details.extend(f"{self._source_title(k)} ({k}): {self._source_note(v, now)}"
+                       for k, v in snap.sources.items())
         if errors or stale:
-            _set_text(self.status, "Avisos: " + ", ".join(sorted(set(errors) | set(stale))))
-        elif snap.sources:
-            ages = [v.age(now) for v in snap.sources.values() if v.acquired_at is not None]
-            age = max(ages) if ages else None
-            _set_text(self.status, f"Mediciones de hace {age:.0f} s" if age is not None else "Sin mediciones válidas")
+            _set_text(self.status, "Avisos: " + ", ".join(
+                self._source_title(k) for k in sorted(set(errors) | set(stale))))
+        elif snap.sources and all(v.acquired_at is None for v in snap.sources.values()):
+            _set_text(self.status, "Sin mediciones válidas")
         elif now - snap.timestamp > self.interval * 5 + 5:
-            _set_text(self.status, "Sin datos recientes")
+            _set_text(self.status, "Sin instantáneas recientes")
         else:
-            _set_text(self.status, f"Instantánea recibida hace {max(0, now - snap.timestamp):.0f} s")
-        self.status.set_tooltip_text("\n".join(details) or None)
+            _set_text(self.status, received)
+        self.status.set_tooltip_text("\n".join(details))
 
     def _render(self, snap: Snapshot) -> None:
         renderers = {
@@ -364,7 +328,9 @@ class SystemMonitorApp(Gtk.Application):
             # Retry into a detached card so a repeated failure cannot destroy the
             # visible error row or expose partially drawn values.
             if name in self._last_render_error:
-                card = MetricCard(PANEL_TITLES[name])
+                card = self._new_card(name)
+                if name == "storage":
+                    card.expansion_state = dict(target.expansion_state)
             try:
                 state = snap.sources.get(name)
                 now = time.monotonic()
@@ -383,6 +349,9 @@ class SystemMonitorApp(Gtk.Application):
                     target.append(body)
                     target._rows = card._rows
                     target._signature = card._signature
+                    if name == "storage":
+                        target.disk_cards = card.disk_cards
+                        target.expansion_state = card.expansion_state
                 self._last_render_error.pop(name, None)
             except Exception as exc:  # a rendering bug must not kill the loop
                 message = f"{type(exc).__name__}: {exc}"
@@ -463,47 +432,8 @@ class SystemMonitorApp(Gtk.Application):
         else:
             card.set_row("swap", "Swap", "No configurada")
 
-    def _render_storage(self, card: MetricCard, snap: Snapshot) -> None:
-        disks = snap.disks
-        if not disks:
-            return self._no_data(card, "No se detectaron discos")
-
-        signature = ("storage", tuple(
-            (d.name, bool(snap.sources.get("smart:" + d.name) or snap.sources.get("temperature:" + d.name)),
-             tuple((p.name, p.depth, p.used_bytes is not None, "usage:" + p.name in snap.sources)
-                   for p in d.partitions))
-            for d in disks
-        ), "topology" in snap.sources)
-        card.reset(signature)
-        now = time.monotonic()
-        topology = snap.sources.get("topology")
-        if topology:
-            card.set_row("topology-state", "Topología", self._source_note(topology, now))
-        for d in disks:
-            card.set_row(
-                f"disk:{d.name}", d.name,
-                f"{d.kind} · {fmt_bytes(d.size_bytes)} · {fmt_temp(d.temperature_c, self.unit)}",
-            )
-            temperature = snap.sources.get("smart:" + d.name) or snap.sources.get("temperature:" + d.name)
-            if temperature:
-                card.set_row(f"temperature-state:{d.name}", "  Temperatura", self._source_note(temperature, now))
-            if not d.partitions:
-                card.set_row(f"nopart:{d.name}", "  Particiones", "N/D")
-            for p in d.partitions:
-                indent = "  " * p.depth
-                mount = ", ".join(p.mountpoints) if p.mountpoints else "Sin montaje"
-                card.set_row(f"part:{d.name}:{p.name}", f"{indent}{p.name}",
-                             f"{p.fstype} · {fmt_bytes(p.size_bytes)} · {mount}")
-                usage = snap.sources.get("usage:" + p.name)
-                if usage:
-                    card.set_row(f"usage-state:{d.name}:{p.name}", f"{indent}  Medición", self._source_note(usage, now))
-                if p.used_bytes is not None:
-                    card.set_row(
-                        f"use:{d.name}:{p.name}", f"{indent}  Uso",
-                        f"{fmt_bytes(p.used_bytes)} usados · {fmt_bytes(p.free_bytes)} libres "
-                        f"({fmt(p.usage_percent, '%')})",
-                        p.usage_percent, self._level(p.usage_percent), bar=True,
-                    )
+    def _render_storage(self, card: StoragePanel, snap: Snapshot) -> None:
+        card.update(snap, time.monotonic())
 
     def _render_sensors(self, card: MetricCard, snap: Snapshot) -> None:
         readings = snap.sensors

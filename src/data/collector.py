@@ -164,13 +164,13 @@ class Collector:
         if self.storage is not None:
             # Storage reports independently timed topology, usage and temperatures.
             for key in list(self._errors):
-                if key == "topology" or key.startswith(("usage:", "smart:", "temperature:")):
+                if key == "topology" or key.startswith(("usage:", "smart:", "temperature:", "udisks:")):
                     self._errors.pop(key)
             snap.disks = self._sample("storage", self.storage, self.storage.get_metrics, [], self.interval)
             states = getattr(self.storage, "sources", {})
             if isinstance(states, dict):
                 for key in list(self._states):
-                    if key == "topology" or key.startswith(("usage:", "smart:", "temperature:")):
+                    if key == "topology" or key.startswith(("usage:", "smart:", "temperature:", "udisks:")):
                         self._states.pop(key)
                 self._states.update(states)
         if self.sensors is not None:
