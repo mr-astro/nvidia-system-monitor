@@ -23,14 +23,14 @@ from src.data.storage import StorageMonitor  # noqa: E402
 from src.gui.widgets import MetricCard, _set_text
 from src.gui.storage import StoragePanel, STORAGE_CSS
 from src.utils.disk_aliases import DiskAliasResolver
-from src.utils.paths import dev_config_dir
+from src.utils.channel import DEFAULT_CHANNEL, STABLE, get_channel
 from src.utils.config import Config  # noqa: E402
 from src.utils.formatting import (  # noqa: E402
     fmt, fmt_mb, fmt_temp, usage_level,
 )
 from src.utils.logger import setup_logging  # noqa: E402
 
-APP_ID = "cl.mastro.NvidiaSystemMonitor.Dev"
+APP_ID = STABLE.application_id
 PANEL_ORDER = ("cpu", "gpu", "ram", "storage", "sensors")
 PANEL_TITLES = {
     "cpu": "CPU",
@@ -94,11 +94,12 @@ def build_css(colors: dict, dark: bool = True) -> str:
 
 
 class SystemMonitorApp(Gtk.Application):
-    def __init__(self, config=None):
-        super().__init__(application_id=APP_ID)
-        self.config = config or Config(dev_config_dir() / "config.json")
-        self.disk_aliases = DiskAliasResolver()
-        self.logger = setup_logging(bool(self.config.get("logging_enabled", True)))
+    def __init__(self, config=None, *, channel=DEFAULT_CHANNEL):
+        self.channel = get_channel(channel)
+        super().__init__(application_id=self.channel.application_id)
+        self.config = config or Config(channel=channel)
+        self.disk_aliases = DiskAliasResolver(channel=channel)
+        self.logger = setup_logging(bool(self.config.get("logging_enabled", True)), channel=channel)
 
         panels = self.config.get("panels", {})
         self.enabled = [p for p in PANEL_ORDER if panels.get(p, True)]
@@ -180,7 +181,7 @@ class SystemMonitorApp(Gtk.Application):
 
     def _build_window(self) -> None:
         self.window = Gtk.ApplicationWindow(application=self)
-        self.window.set_title("NVIDIA System Monitor DEV")
+        self.window.set_title(self.channel.title)
         self.window.set_icon_name("cl.mastro.NvidiaSystemMonitor")
         self.window.set_default_size(1000, 720)
         self.window.set_size_request(380, 320)
@@ -447,9 +448,9 @@ class SystemMonitorApp(Gtk.Application):
             card.set_row("more", "…", f"{len(readings) - len(shown)} sensores más")
 
 
-def main() -> int:
-    app = SystemMonitorApp()
-    return app.run(sys.argv)
+def main(channel=DEFAULT_CHANNEL, argv=None) -> int:
+    app = SystemMonitorApp(channel=channel)
+    return app.run(sys.argv if argv is None else argv)
 
 
 if __name__ == "__main__":

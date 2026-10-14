@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=NVIDIA System Monitor DEV
+Comment=Monitor de hardware para Fedora Linux (DEV)
+Exec=python3 "@APP_DIR@/bin/system_monitor.py" --channel dev
+Icon=cl.mastro.NvidiaSystemMonitor
+Terminal=false
+Categories=System;Monitor;GTK;
+StartupNotify=true

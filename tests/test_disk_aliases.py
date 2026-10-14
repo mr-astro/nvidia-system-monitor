@@ -99,11 +99,11 @@ class DiskAliases(unittest.TestCase):
 
     def test_xdg_user_configs_and_stable_are_independent(self):
         with mock.patch.dict('os.environ', {'XDG_CONFIG_HOME': str(self.root / 'user-a')}):
-            first = DiskAliasResolver().config_path
+            first = DiskAliasResolver(channel='dev').config_path
             self.assertEqual(first.parent, dev_config_dir())
             self.assertNotEqual(first.parent, config_dir())
         with mock.patch.dict('os.environ', {'XDG_CONFIG_HOME': str(self.root / 'user-b')}):
-            second = DiskAliasResolver().config_path
+            second = DiskAliasResolver(channel='dev').config_path
         self.assertNotEqual(first, second)
 
 

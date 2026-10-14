@@ -1,8 +1,13 @@
-# No third-party Python packages are required.
+# Python >= 3.10. No additional pip packages are required.
+# PyGObject (including Gio) is supplied by system packages.
 # Fedora system packages required:
-#   gtk4
+#   gtk4 >= 4.6
 #   python3-gobject
+#   util-linux      (lsblk, storage topology)
 #
 # Optional:
 #   lm_sensors      (panel de sensores)
-#   smartmontools   (temperatura SATA; normalmente requiere root)
+#   udisks2         (stored SMART temperatures, optional system service)
+#   smartmontools   (smartctl fallback; device permissions required)
+#   NVIDIA driver   (nvidia-smi for GPU telemetry)
+# Test GUI/isolation tools: xvfb-run, Xvfb, xauth, dbus-run-session.

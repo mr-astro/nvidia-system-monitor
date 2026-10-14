@@ -523,7 +523,7 @@ class GuiSmoke(unittest.TestCase):
         self.assertTrue(next(iter(panel.disk_cards.values())).expander.get_expanded())
         self.assertNotIn('storage', app._last_render_error)
 
-    def test_default_dev_config_and_application_id_are_independent(self):
+    def test_explicit_dev_config_and_application_id_are_independent(self):
         from src.gui.app import SystemMonitorApp
         with tempfile.TemporaryDirectory() as temporary, mock.patch.dict('os.environ', {'XDG_CONFIG_HOME': temporary}):
             root = Path(temporary)
@@ -534,7 +534,7 @@ class GuiSmoke(unittest.TestCase):
             stable_text = '{"refresh_interval_seconds": 1, "logging_enabled": false}'
             (stable / 'config.json').write_text(stable_text)
             (dev / 'config.json').write_text('{"refresh_interval_seconds": 3, "logging_enabled": false}')
-            app = SystemMonitorApp()
+            app = SystemMonitorApp(channel='dev')
             self.assertEqual(app.interval, 3)
             self.assertEqual(app.config.path, dev / 'config.json')
             self.assertTrue(app.get_application_id().endswith('.Dev'))

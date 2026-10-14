@@ -7,13 +7,17 @@ from pathlib import Path
 from typing import Optional
 
 from src.utils.paths import state_dir
+from src.utils.channel import DEFAULT_CHANNEL, STABLE, get_channel
 
-LOGGER_NAME = "nvidia-system-monitor"
+LOGGER_NAME = STABLE.logger_name
 
 
-def setup_logging(enabled: bool = True, log_dir: Optional[Path] = None) -> logging.Logger:
-    logger = logging.getLogger(LOGGER_NAME)
+def setup_logging(enabled: bool = True, log_dir: Optional[Path] = None, *,
+                  channel: str = DEFAULT_CHANNEL) -> logging.Logger:
+    logger = logging.getLogger(get_channel(channel).logger_name)
     logger.setLevel(logging.INFO)
+    # Keep host/root handlers from forwarding one channel's records elsewhere.
+    logger.propagate = False
 
     if logger.handlers:
         return logger
@@ -21,7 +25,7 @@ def setup_logging(enabled: bool = True, log_dir: Optional[Path] = None) -> loggi
     handler: logging.Handler = logging.NullHandler()
     if enabled:
         try:
-            directory = Path(log_dir) if log_dir else state_dir()
+            directory = Path(log_dir) if log_dir else state_dir(channel)
             directory.mkdir(parents=True, exist_ok=True)
             handler = RotatingFileHandler(
                 directory / "monitor.log",

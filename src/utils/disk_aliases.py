@@ -10,7 +10,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.utils.paths import dev_config_dir
+from src.utils.paths import config_dir
+from src.utils.channel import DEFAULT_CHANNEL, get_channel
 
 _PARTITION = re.compile(r"-part\d+$")
 _PREFIXES = ("wwn-", "nvme-eui.", "nvme-uuid.", "ata-", "nvme-", "scsi-", "usb-")
@@ -29,8 +30,9 @@ def valid_id(value):
 
 
 class DiskAliasResolver:
-    def __init__(self, config_path=None, by_id_dir="/dev/disk/by-id", device_dir="/dev"):
-        self.config_path = Path(config_path) if config_path is not None else dev_config_dir() / "storage-aliases.json"
+    def __init__(self, config_path=None, by_id_dir="/dev/disk/by-id", device_dir="/dev", *, channel=DEFAULT_CHANNEL):
+        get_channel(channel)
+        self.config_path = Path(config_path) if config_path is not None else config_dir(channel) / "storage-aliases.json"
         self.by_id_dir = Path(by_id_dir)
         self.device_dir = Path(device_dir).resolve()
         self._generation = object()

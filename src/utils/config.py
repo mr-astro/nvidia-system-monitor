@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.utils.paths import config_dir
+from src.utils.channel import DEFAULT_CHANNEL, get_channel
 
 DEFAULT_CONFIG = {
     "refresh_interval_seconds": 1.0,
@@ -95,8 +96,9 @@ def sanitize(data: dict) -> dict:
 
 
 class Config:
-    def __init__(self, path: Optional[Path] = None):
-        self.path = Path(path) if path else config_dir() / "config.json"
+    def __init__(self, path: Optional[Path] = None, *, channel: str = DEFAULT_CHANNEL):
+        get_channel(channel)
+        self.path = Path(path) if path else config_dir(channel) / "config.json"
         self.values = copy.deepcopy(DEFAULT_CONFIG)
         self.load()
 

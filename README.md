@@ -4,6 +4,11 @@
 
 Monitor de escritorio GTK4 para Linux (desarrollado y probado en Fedora): GPU NVIDIA, CPU, RAM y almacenamiento, con sensores opcionales.
 
+Este README describe el código de esta rama. El canal selecciona identidad y rutas;
+no cambia de versión ni integra esta rama en `main`. A2, A3, A4, A5 y A6 de la
+auditoría siguen pendientes antes de integrar a estable; el ajuste del instalador
+para separar canales pertenece a A1 y no resuelve el resto de A5.
+
 ## Qué monitoriza
 
 **GPU NVIDIA** (vía `nvidia-smi`; soporta varias GPU): modelo, uso, VRAM, temperatura,
@@ -28,36 +33,53 @@ Los datos ausentes se muestran como `N/D`; nunca se sustituyen por valores inven
 
 ## Instalación
 
+Requisitos: Linux, Python **3.10 o posterior**, PyGObject y GTK **4.6 o posterior**.
+Se utiliza [`Gtk.FlowBox.append`, disponible desde GTK 4.6](https://docs.gtk.org/gtk4/method.FlowBox.append.html).
+El namespace de introspección sigue siendo `Gtk` versión `4.0`; esto no significa
+que cualquier versión menor de GTK 4 sea suficiente. La carga de CSS conserva una
+alternativa para GTK anterior a 4.12. `lsblk` (util-linux) es necesario para detectar
+la topología del almacenamiento. La aplicación requiere una sesión gráfica para
+mostrar la interfaz.
+
 ### Fedora
 
 ```bash
-sudo dnf install gtk4 python3-gobject
+sudo dnf install python3 gtk4 python3-gobject util-linux
 ```
 
 ### Otras distribuciones
 
-- **Ubuntu / Debian** (nombres de paquete verificados contra los repositorios de Ubuntu 24.04):
+- **Ubuntu / Debian** (compruebe que la versión de la distribución proporciona GTK ≥ 4.6):
 
 ```bash
-sudo apt install python3-gi gir1.2-gtk-4.0
+sudo apt install python3 python3-gi gir1.2-gtk-4.0 util-linux
 ```
 
 - **Arch Linux / Manjaro** (sin probar):
 
 ```bash
-sudo pacman -S gtk4 python-gobject
+sudo pacman -S python gtk4 python-gobject util-linux
 ```
 
-No se necesita `pip` ni libadwaita.
+No se necesitan paquetes adicionales mediante `pip` ni libadwaita; PyGObject y
+las bibliotecas de introspección se instalan con los paquetes del sistema.
 
 ### Opcionales
 
 ```bash
 sudo dnf install lm_sensors        # panel de sensores
-sudo dnf install smartmontools     # temperatura de discos SATA/USB (requiere root)
+sudo dnf install udisks2           # temperaturas SMART almacenadas, si están disponibles
+sudo dnf install smartmontools     # alternativa smartctl; necesita permisos sobre el dispositivo
 ```
 
-**Temperatura de discos SATA sin root:** cargue el módulo `drivetemp` del kernel.
+`nvidia-smi`, proporcionado por el driver NVIDIA, es opcional para el resto de
+paneles. Gio viene con PyGObject y permite consultar UDisks2 por D-Bus; no se
+requiere un binding D-Bus adicional. Instalar UDisks2 no garantiza temperaturas:
+el servicio debe estar disponible y exponer SMART habilitado y una medición válida
+para ese disco. La aplicación no inicia el servicio ni pide autenticación.
+
+**Otra fuente SATA sin ejecutar la aplicación como root:** el módulo `drivetemp`
+del kernel, cuando el hardware lo admite. Su carga requiere administración:
 
 ```bash
 sudo modprobe drivetemp                                         # hasta el próximo reinicio
@@ -66,38 +88,108 @@ echo drivetemp | sudo tee /etc/modules-load.d/drivetemp.conf    # permanente
 
 ## Ejecución
 
-```bash
-python3 bin/system_monitor.py
-```
-
-Para añadirlo al menú de aplicaciones (crea el lanzador con la ruta correcta y copia la
-configuración de ejemplo si aún no tienes una):
+Desde la raíz del repositorio:
 
 ```bash
-./install.sh              # instalar
-./install.sh --uninstall  # quitar el lanzador (no borra tu configuración)
+python3 bin/system_monitor.py --channel dev
+python3 bin/system_monitor.py --channel stable
+python3 bin/system_monitor.py                 # stable, por compatibilidad histórica
 ```
+
+También se admite `--channel=dev`. El canal se valida antes de importar GTK;
+un valor inválido o repetido produce un error. Los demás argumentos se entregan
+a GTK sin cambios; `--` termina el procesamiento de opciones propias. No se
+deduce el canal de la rama Git, la ubicación del repositorio ni el usuario.
+
+Los canales usan IDs GTK diferentes y pueden ejecutarse simultáneamente. Una
+segunda instancia del mismo canal activa la existente. El canal `stable` conserva
+la identidad de las instalaciones anteriores, por lo que puede activar una
+instancia estable ya abierta: use `--channel dev` para trabajar en esta rama.
+
+El instalador fuente permite añadir al menú un launcher por canal y copiar la
+configuración de ejemplo solo si no existe:
+
+```bash
+./install.sh --channel dev
+./install.sh --channel dev --check-launcher     # comprobar sin escribir
+./install.sh --channel dev --uninstall
+./install.sh --channel stable
+./install.sh --uninstall                       # stable por defecto
+```
+
+Estos comandos modifican la instalación si se ejecutan. El launcher DEV es
+`cl.mastro.NvidiaSystemMonitor.Dev.desktop`; el estable conserva
+`cl.mastro.NvidiaSystemMonitor.desktop`. Las plantillas nuevas indican su canal explícitamente.
+DEV no reemplaza el launcher, configuración ni icono de estable. El icono visual
+se comparte por nombre; si no está instalado, el entorno puede mostrar un icono
+genérico. El instalador estable conserva la copia del icono a `/usr/share/icons`
+mediante `sudo`, incluida su comprobación al desinstalar; esa parte de A5 sigue
+pendiente. Los comandos mostrados deben ejecutarse desde la raíz del repositorio.
+
+**Migración de launchers DEV anteriores:** los instalados antes de esta separación
+pueden carecer de `--channel dev`. Con el nuevo valor predeterminado iniciarían
+la identidad estable, aunque el menú diga DEV. Deben regenerarse; modificar el
+código o la plantilla no actualiza el launcher ya instalado.
+
+Primero ejecute `./install.sh --channel dev --check-launcher`. Es una comprobación
+de solo lectura: devuelve 0 si está compatible o ausente, 3 si detecta un launcher
+DEV antiguo y 2 si rechaza una ruta, enlace o contenido inseguro. La regeneración
+se solicita después mediante `./install.sh --channel dev`; reemplaza únicamente
+el archivo DEV y conserva la configuración existente. El cambio de `Exec` es:
+
+```diff
+-Exec=python3 "RUTA_DEL_REPOSITORIO/bin/system_monitor.py"
++Exec=python3 "RUTA_DEL_REPOSITORIO/bin/system_monitor.py" --channel dev
+```
+
+La ruta real del repositorio se conserva al regenerar desde ese mismo repositorio.
+El launcher estable no necesita migración para mantener su funcionamiento histórico.
+La comprobación no instala ni regenera archivos automáticamente.
+
+El helper `src/utils/installer.py` valida el canal de la plantilla y del launcher
+existente, y obtiene el nombre de destino de la definición central de canales.
+Rechaza enlaces simbólicos (también colgantes), archivos con enlaces duros y
+directorios padres enlazados, tanto al instalar como al desinstalar. La instalación
+recorre los directorios con `O_NOFOLLOW`, conserva sus descriptores abiertos y
+reemplaza el launcher por un archivo temporal del mismo directorio mediante
+renombrado atómico. La configuración inicial se publica sin sobrescribir un
+archivo que aparezca concurrentemente. La desinstalación usa `unlink` relativo al
+descriptor y nunca sigue el enlace final.
+
+Esto evita escribir a través de enlaces y redirigir operaciones mediante una
+sustitución de directorios padres. Si un directorio abierto se renombra durante
+la operación, esta puede afectar al directorio original, ahora movido; puede ser
+necesario repetir la instalación cuando la ruta vuelva a estar estable. No es una
+barrera de seguridad frente a procesos maliciosos con los mismos permisos, ni una
+transacción conjunta entre configuración, launcher, caché e icono. Los directorios
+XDG que usan enlaces legítimos deben cambiarse por rutas físicas para instalar.
 
 ## Configuración
 
-Archivo: `~/.config/nvidia-system-monitor/config.json` (respeta `XDG_CONFIG_HOME`).
+Las rutas son explícitas por canal:
+
+| Recurso | `stable` (predeterminado) | `dev` |
+|---|---|---|
+| ID GTK | `cl.mastro.NvidiaSystemMonitor` | `cl.mastro.NvidiaSystemMonitor.Dev` |
+| Título | NVIDIA System Monitor | NVIDIA System Monitor DEV |
+| Configuración | `~/.config/nvidia-system-monitor/config.json` | `~/.config/nvidia-system-monitor-dev/config.json` |
+| Estado | `~/.local/state/nvidia-system-monitor/` | `~/.local/state/nvidia-system-monitor-dev/` |
+| Registro | `monitor.log` en el estado estable | `monitor.log` en el estado DEV |
+
+Se respetan `XDG_CONFIG_HOME` y `XDG_STATE_HOME` si contienen rutas absolutas;
+los valores vacíos o relativos usan las alternativas de la tabla. No se migran
+ni copian preferencias o registros entre canales. Antes de esta separación, DEV
+compartía el registro estable; ese archivo existente se conserva tal cual.
+
 Hay un ejemplo completo en `config.json.example`. Todos los campos son opcionales; los
 valores inválidos se ignoran y se usa el valor por defecto.
 
-En la rama de desarrollo, la aplicación **DEV** utiliza
-`~/.config/nvidia-system-monitor-dev/config.json` y un identificador GTK independiente.
-La infraestructura de alias se conserva y lee `storage-aliases.json` en ese
-mismo directorio XDG, reservada para una futura opción de personalización:
-
-```json
-{"aliases": {"wwn-IDENTIFICADOR_DEL_DISCO": "Mi respaldo"}}
-```
-
-La clave debe ser un enlace de disco completo existente en `/dev/disk/by-id`,
-preferentemente WWN; también se admiten identificadores de serie inequívocos.
-Los alias son preferencias locales: no se guardan identificadores reales en el
-repositorio. Las tarjetas siempre usan el modelo detectado o el nombre técnico
-cuando no hay modelo; los alias no sustituyen sus títulos. Las
+El código lee `storage-aliases.json` en el directorio de configuración del canal y
+resuelve identidades mediante enlaces existentes de discos completos en
+`/dev/disk/by-id`, dando preferencia a WWN. No existe una interfaz para editar
+alias; los nombres configurados tampoco sustituyen los títulos. Las tarjetas
+siempre muestran el modelo detectado o el nombre técnico cuando falta el modelo.
+No se guardan identificadores reales de discos en el repositorio. Las
 particiones se despliegan por disco y conservan su estado durante las actualizaciones.
 Los diagnósticos completos están en tooltips; las fuentes obsoletas mantienen su aviso.
 
@@ -129,14 +221,15 @@ una sola vez, sin sumar subvolúmenes. Sin montaje o medición aparece «Uso no
 disponible»; un fallo temporal conserva el último uso con aviso y antigüedad,
 mientras que un cambio de identidad del montaje lo invalida inmediatamente.
 
-Para temperatura SATA, DEV prueba sysfs/drivetemp, después las propiedades
+Para temperatura SATA, el código de esta rama prueba sysfs/drivetemp, después las propiedades
 almacenadas de UDisks2 en el bus D-Bus del sistema y, si es necesario, `smartctl`.
 Gio forma parte del PyGObject existente; UDisks2 es opcional. No se inicia el
 servicio, no se fuerza `SmartUpdate` ni se solicita autenticación. La antigüedad
 proviene de `SmartUpdated`, no de la consulta D-Bus, y la misma medición no se
-rejuvenece al volver a leerla. La fuente UDisks2 utiliza un umbral propio basado
-en su mantenimiento habitual de diez minutos (752 s con el timeout predeterminado);
-su antigüedad aparece junto a la temperatura. Se evalúan alternativas si falla
+rejuvenece al volver a leerla. La fuente UDisks2 utiliza una cadencia de referencia
+de 600 s para calcular su umbral de caducidad (752 s con el timeout predeterminado);
+esto no configura ni garantiza la frecuencia de actualización del servicio.
+Su antigüedad aparece junto a la temperatura. Se evalúan alternativas si falla
 o caduca y se conserva una medición reciente frente a otra más antigua. Los errores
 de permisos de `smartctl` permanecen en el diagnóstico y no ocultan una temperatura
 válida de otra fuente.
@@ -152,16 +245,20 @@ válida de otra fuente.
 | `color_scheme.low/medium/high_usage_color` | verde / naranja / rojo | Colores de las barras de uso, en formato `#RRGGBB`. |
 | `thresholds.medium_percent / high_percent` | `60` / `85` | Porcentajes a partir de los cuales la barra cambia de color. |
 
-Registro: `~/.local/state/nvidia-system-monitor/monitor.log` (rotativo, máx. 3 × 512 KB).
+Cada canal utiliza un logger y handlers propios, sin propagar mensajes al logger
+raíz. Su `monitor.log` es rotativo: 512 KiB más dos archivos de respaldo. Si no
+puede abrirse, el registro se desactiva sin impedir el inicio de la aplicación.
 
 ## Pruebas
 
 ```bash
-python3 -m unittest discover -s tests -t . -v
+python3 -B -m unittest discover -s tests -t . -v
 ```
 
-Las pruebas usan datos simulados (salidas de `nvidia-smi`, `lsblk`, `sensors`, `smartctl`, `/proc`, `/sys`) y no dependen del hardware de la máquina. Las pruebas de interfaz se
-omiten automáticamente si no hay GTK 4 o pantalla. Para comprobar también el reflujo,
+Las pruebas usan datos simulados (salidas de `nvidia-smi`, `lsblk`, `sensors`, `smartctl`, `/proc`, `/sys`) y no dependen del hardware de la máquina. Requieren PyGObject/Gio
+para las pruebas del transporte UDisks2. Las pruebas de interfaz se
+omiten automáticamente si no hay GTK o pantalla; la prueba simultánea de canales
+también requiere `dbus-run-session`. Para comprobar también el reflujo,
 la pantalla virtual debe admitir la ventana de escritorio. Este comando fuerza X11
 en sesiones Wayland y usa Cairo para evitar depender de aceleración en Xvfb:
 
@@ -170,8 +267,17 @@ xvfb-run -a -s '-screen 0 1280x1024x24' \
   env GDK_BACKEND=x11 GSK_RENDERER=cairo python3 -B -m unittest discover -s tests -t . -v
 ```
 
-El flujo de GitHub Actions (`.github/workflows/tests.yml`) ejecuta toda la suite, incluida
-la interfaz, en cada `push` y `pull request`.
+En Fedora, las herramientas de pruebas se pueden instalar con:
+
+```bash
+sudo dnf install xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon
+```
+
+Se necesitan `xvfb-run`, Xvfb, `xauth` y `dbus-run-session` para ejecutar todas las
+pruebas de interfaz y aislamiento. La prueba de canales crea su propio bus de
+sesión y directorios XDG temporales. Verifique que el resultado no tenga omisiones
+para considerar completa la validación. Esta rama no contiene un workflow de
+GitHub Actions; la suite se ejecuta manualmente con los comandos anteriores.
 
 ## Diseño técnico
 
@@ -188,8 +294,17 @@ en segundo plano**. El bucle de GTK solo lee la última instantánea y actualiza
 widgets existentes, por lo que un `nvidia-smi` lento o colgado no congela la ventana.
 - Cada fuente falla de forma aislada: si una falla, las demás siguen funcionando y el
 encabezado muestra un aviso (el detalle aparece al pasar el cursor).
-- La topología de discos (`lsblk`) se consulta cada 15 s; los sensores, cada 5 s;
-`smartctl`, como máximo cada 10 s por disco (cada 5 min si falla).
+- La topología de discos (`lsblk`) se consulta cada 15 s; los sensores, cada 5 s.
+UDisks2 comparte una consulta entre discos cada 10 s y espera 300 s tras un fallo.
+`smartctl -A` se usa como alternativa y almacena una lectura de temperatura durante
+10 s por disco; sin lectura espera 300 s antes de reintentar. Una temperatura
+extraída con diagnóstico de error conserva ese diagnóstico.
+- La edad de una temperatura SMART directa se ancla a su adquisición; la de UDisks2,
+a `SmartUpdated`. Volver a consultar una lectura almacenada no reinicia su edad.
+El umbral SMART directo es 14,5 s con los parámetros predeterminados; el de UDisks2
+es 752 s. Un error genera aviso inmediatamente; al superar el umbral, la tarjeta
+deja de mostrar la temperatura y conserva el último valor y edad en el tooltip.
+Los 300 s de reintento tras fallo no extienden la validez de la lectura anterior.
 - No se ejecutan benchmarks de almacenamiento.
 
 ## Limitaciones
@@ -198,7 +313,9 @@ encabezado muestra un aviso (el detalle aparece al pasar el cursor).
 sensores que Linux exponga.
 - **No se muestra el consumo eléctrico de la CPU**: no existe una fuente fiable y
 universal sin privilegios, y no se presenta una estimación como si fuera una medición.
-- La temperatura de discos NVMe se lee de sysfs sin privilegios. La de discos SATA se
-obtiene del módulo `drivetemp` si está cargado; si no, de `smartctl`, que normalmente
-exige root. Sin ninguna de las dos se muestra `N/D`.
+- La temperatura NVMe se intenta leer de sysfs y, si no está disponible, de
+`smartctl`. Para SATA se intenta drivetemp, luego UDisks2 y finalmente `smartctl`.
+La disponibilidad depende del hardware, soporte del kernel, propiedades SMART
+del servicio y permisos de lectura. La aplicación no eleva privilegios; si no
+hay una medición disponible dentro de su umbral de edad, se muestra `N/D`.
 - Solo se consulta `nvidia-smi`; no hay soporte para GPU AMD o Intel.
