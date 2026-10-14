@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, replace
 
 from src.data.errors import SourceState, freshness
+from src.data.identity import identifier, wwn
 
 BLOCK = "org.freedesktop.UDisks2.Block"
 ATA = "org.freedesktop.UDisks2.Drive.Ata"
@@ -42,6 +43,43 @@ class UDisksTemperature:
         self._error = None
         # Device -> (persistent identity, SmartUpdated, reading).
         self._samples = {}
+        self._contexts = set()
+        self._refresh_requested = False
+
+    def prepare(self, contexts):
+        if contexts - self._contexts:
+            self._refresh_requested = True
+        for old in self._contexts - contexts:
+            self._samples.pop(old, None)
+        self._contexts = contexts
+
+    def invalidate(self, context):
+        self._samples.pop(context, None)
+        self._contexts.discard(context)
+
+    def rebind(self, old, new):
+        """Enrich corroboration for an unchanged kernel attachment, not a new disk."""
+        if old in self._samples:
+            _, updated, reading = self._samples.pop(old)
+            self._samples[new] = (new, updated, reading)
+        if old in self._contexts:
+            self._contexts.remove(old)
+            self._contexts.add(new)
+
+    @staticmethod
+    def _matches(block, drive, context):
+        expected = context.identity
+        checks = []
+        actual_wwn = wwn(drive.get('WWN'))
+        actual_serial = identifier(drive.get('Serial'))
+        if expected.wwn and actual_wwn:
+            checks.append(expected.wwn == actual_wwn)
+        if expected.serial and actual_serial:
+            checks.append(expected.serial == actual_serial)
+        block_id = block.get('Id', '')
+        if expected.wwn and isinstance(block_id, str) and block_id.startswith('by-id-wwn-'):
+            checks.append(expected.wwn == wwn(block_id.removeprefix('by-id-')))
+        return bool(checks) and all(checks)
 
     def _managed_objects(self):
         # Lazy import keeps this optional source usable without GUI imports.
@@ -74,8 +112,9 @@ class UDisksTemperature:
 
     def _refresh(self):
         now = self._clock()
-        if self._next_read is not None and now < self._next_read:
+        if self._next_read is not None and now < self._next_read and (not self._refresh_requested or self._error):
             return
+        self._refresh_requested = False
         try:
             objects = self._fetch()
             if not isinstance(objects, dict) or any(
@@ -97,12 +136,17 @@ class UDisksTemperature:
         reading = previous[2] if previous else TemperatureReading(None, SourceState(max_age=self.max_age))
         return TemperatureReading(reading.value, replace(reading.state, error=error))
 
-    def read(self, name):
+    def read(self, name, context=None):
+        key = name if context is None else context
         if not isinstance(name, str) or not _NAME.fullmatch(name):
-            return self._unavailable(name, "UDisks2: nombre de dispositivo no válido", retain=False)
+            return self._unavailable(key, "UDisks2: nombre de dispositivo no válido", retain=False)
+        if context is not None and (not context.identity.cacheable or not context.identity.physical):
+            return self._unavailable(key, 'UDisks2: asociación física o sesión no verificable', retain=False)
+        if context is not None and context not in self._contexts:
+            self.prepare(self._contexts | {context})
         self._refresh()
         if self._error:
-            return self._unavailable(name, self._error)
+            return self._unavailable(key, self._error)
         matches = []
         for interfaces in self._objects.values():
             block = interfaces.get(BLOCK, {})
@@ -117,34 +161,41 @@ class UDisksTemperature:
             if device == "/dev/" + name and "org.freedesktop.UDisks2.Partition" not in interfaces:
                 matches.append(block)
         if len(matches) != 1:
-            self._samples.pop(name, None)
-            return self._unavailable(name, "UDisks2: dispositivo ausente o identidad ambigua", retain=False)
+            self._samples.pop(key, None)
+            return self._unavailable(key, "UDisks2: dispositivo ausente o identidad ambigua", retain=False)
         block = matches[0]
         drive = block.get("Drive")
         identity = (block.get("Id"), drive)
         if not isinstance(identity[0], str) or not identity[0] or not isinstance(drive, str) or drive == "/":
-            self._samples.pop(name, None)
-            return self._unavailable(name, "UDisks2: identidad física no verificable", retain=False)
-        previous = self._samples.get(name)
+            self._samples.pop(key, None)
+            return self._unavailable(key, "UDisks2: identidad física no verificable", retain=False)
+        if context is not None:
+            if not self._matches(block, self._objects.get(drive, {}).get('org.freedesktop.UDisks2.Drive', {}), context):
+                self._samples.pop(key, None)
+                return self._unavailable(key, 'UDisks2: ObjectManager no corresponde a la identidad actual', retain=False)
+            # Physical evidence is corroborated above; a D-Bus path/name change
+            # must not reanchor the same physical SMART measurement.
+            identity = context
+        previous = self._samples.get(key)
         if previous and previous[0] != identity:
-            self._samples.pop(name)
+            self._samples.pop(key)
             previous = None
         ata = self._objects.get(drive, {}).get(ATA, {})
         if ata.get("SmartSupported") is not True or ata.get("SmartEnabled") is not True:
-            return self._unavailable(name, "UDisks2: SMART no disponible o deshabilitado")
+            return self._unavailable(key, "UDisks2: SMART no disponible o deshabilitado")
         updated, kelvin = ata.get("SmartUpdated"), ata.get("SmartTemperature")
         wall = self._wall_clock()
         if (isinstance(updated, bool) or not isinstance(updated, int) or updated <= 0
                 or (updated > wall + 1 and not (previous and updated == previous[1])) or isinstance(kelvin, bool)
                 or not isinstance(kelvin, (int, float)) or not math.isfinite(kelvin)
                 or kelvin <= 0):
-            return self._unavailable(name, "UDisks2: temperatura o SmartUpdated no válidos")
+            return self._unavailable(key, "UDisks2: temperatura o SmartUpdated no válidos")
         if previous and updated < previous[1]:
-            return self._unavailable(name, "UDisks2: SmartUpdated retrocedió")
+            return self._unavailable(key, "UDisks2: SmartUpdated retrocedió")
         # Anchor once per actual SMART measurement, never once per D-Bus read.
         measured = previous[2].state.acquired_at if previous and updated == previous[1] else (
             self._clock() - max(0.0, wall - updated)
         )
         reading = TemperatureReading(kelvin - 273.15, SourceState(measured, measured, self.max_age))
-        self._samples[name] = (identity, updated, reading)
+        self._samples[key] = (identity, updated, reading)
         return reading

@@ -67,6 +67,7 @@ class Collector:
         self._thread: Optional[threading.Thread] = None
         self._sequence = 0
         self._last_logged: dict = {}
+        self._thermal_generations = {}
         self._sensors_cache: list = []
         self._sensors_at: Optional[float] = None
         self._states = {}
@@ -125,6 +126,13 @@ class Collector:
         started = self._clock()
         errors = {}
         value = self._guard(name, errors, fn, default)
+        if name == 'storage':
+            generations = getattr(monitor, 'thermal_generations', {})
+            if isinstance(generations, dict):
+                for key in self._thermal_generations.keys() | generations.keys():
+                    if self._thermal_generations.get(key) != generations.get(key):
+                        self._last_logged.pop(key, None)
+                self._thermal_generations = dict(generations)
         diagnostics = getattr(monitor, "errors", {})
         errors.update(diagnostics if isinstance(diagnostics, dict) else {})
         error = errors.get(name)

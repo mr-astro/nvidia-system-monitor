@@ -18,13 +18,14 @@ from typing import Optional
 
 from src.data.errors import SourceState, command_error, freshness
 from src.data.udisks import UDisksTemperature
+from src.data.identity import DeviceIdentity, Presence, probe, sequence
 
 ND = "N/D"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _ATA_TEMP_ATTRIBUTES = {"Temperature_Celsius", "Airflow_Temperature_Cel", "Temperature_Internal"}
 _SIMPLE_TEMP = re.compile(r"(?:Temperature|Current Drive Temperature):\s*(\d+)\b")
 
-LSBLK_COLUMNS = "NAME,TYPE,SIZE,MODEL,TRAN,MOUNTPOINTS,ROTA,FSTYPE,MAJ:MIN,LABEL"
+LSBLK_COLUMNS = "NAME,TYPE,SIZE,MODEL,TRAN,MOUNTPOINTS,ROTA,FSTYPE,MAJ:MIN,LABEL,WWN,SERIAL,DISKSEQ"
 # util-linux < 2.37 has no MOUNTPOINTS column.
 LSBLK_COLUMNS_LEGACY = LSBLK_COLUMNS.replace("MOUNTPOINTS", "MOUNTPOINT")
 
@@ -71,6 +72,7 @@ class StorageMonitor:
         clock=time.monotonic,
         mountinfo_path="/proc/self/mountinfo",
         udisks=None,
+        identity_reader=None,
     ):
         self.timeout = timeout
         self.topology_interval = topology_interval
@@ -98,6 +100,13 @@ class StorageMonitor:
         ) if udisks is None else udisks
         self._selected_temperatures = {}
         self._temperature_sources = {}
+        self._identity_reader = identity_reader or (lambda name, node: probe(name, node, self._sys))
+        self._bindings = {}
+        self._device_nodes = {}
+        self._generation = 0
+        self._unverified_retries = {}
+        self.thermal_generations = {}
+        self._lsblk_columns = None
 
     # ---- topology -------------------------------------------------------
 
@@ -120,7 +129,30 @@ class StorageMonitor:
         if not self._lsblk:
             self.errors["topology"] = "lsblk: utilidad no disponible"
             return None
-        for columns in (LSBLK_COLUMNS, LSBLK_COLUMNS_LEGACY):
+        # Correlate optional lsblk IDs with attachment tokens around the command,
+        # including new names. Some util-linux versions lack a DISKSEQ column.
+        def diskseq(name):
+            try:
+                with open(os.path.join(self._sys, 'class', 'block', name, 'diskseq'), encoding='utf-8') as stream:
+                    return sequence(stream.read().strip())
+            except OSError:
+                return None
+        try:
+            names = os.listdir(os.path.join(self._sys, 'class', 'block'))
+        except OSError:
+            names = []
+        before = {name: diskseq(name) for name in names}
+        basic = LSBLK_COLUMNS.rsplit(',WWN', 1)[0]
+        without_seq = LSBLK_COLUMNS.rsplit(',DISKSEQ', 1)[0]
+        variants = [LSBLK_COLUMNS, LSBLK_COLUMNS_LEGACY, without_seq,
+                    without_seq.replace('MOUNTPOINTS', 'MOUNTPOINT'), basic,
+                    basic.replace('MOUNTPOINTS', 'MOUNTPOINT')]
+        if self._lsblk_columns:
+            variants.insert(0, self._lsblk_columns)
+        unsupported = set()
+        for columns in dict.fromkeys(variants):
+            if unsupported.intersection(columns.split(',')):
+                continue
             try:
                 result = subprocess.run(
                     [self._lsblk, "-J", "-b", "-o", columns],
@@ -135,10 +167,18 @@ class StorageMonitor:
                     self.errors["topology"] = "lsblk: JSON de topología malformado"
                 else:
                     self.errors.pop("topology", None)
+                    self._lsblk_columns = columns
+                    for device in devices:
+                        name = device['name']
+                        value = diskseq(name)
+                        if value is not None and before.get(name) == value:
+                            device['_observed_diskseq'] = value
                 return devices
             self.errors["topology"] = command_error("lsblk", result=result)
-            if "MOUNTPOINTS" not in getattr(result, "stderr", ""):
+            if not any(column in getattr(result, 'stderr', '') for column in ('MOUNTPOINTS', 'WWN', 'SERIAL', 'DISKSEQ')):
                 break
+            unsupported.update(column for column in ('MOUNTPOINTS', 'WWN', 'SERIAL', 'DISKSEQ')
+                               if column in getattr(result, 'stderr', ''))
         return None
 
     @staticmethod
@@ -381,7 +421,7 @@ class StorageMonitor:
         self._temperature_cache[name] = (self._clock() + ttl, value)
         return value
 
-    def _temperature(self, name: str) -> Optional[float]:
+    def _read_temperature(self, name: str) -> Optional[float]:
         started = self._clock()
         if name.startswith("nvme"):
             value = self._nvme_temperature(name)
@@ -418,7 +458,7 @@ class StorageMonitor:
             candidates[previous[1]] = previous[0]
         udisks_key = "udisks:" + name
         if self._udisks:
-            reading = self._udisks.read(name)
+            reading = self._udisks.read(name, context=self._bindings[name])
             self.sources[udisks_key] = reading.state
             if reading.state.error:
                 self.errors[udisks_key] = reading.state.error
@@ -454,9 +494,141 @@ class StorageMonitor:
         self._temperature_sources[name] = udisks_key if self._udisks else "smart:" + name
         return None
 
+    def _clear_thermal(self, name, *, forget=True):
+        binding = self._bindings.get(name)
+        if forget and binding and self._udisks:
+            self._udisks.invalidate(binding)
+        self._temperature_cache.pop(name, None)
+        self._selected_temperatures.pop(name, None)
+        self._temperature_sources.pop(name, None)
+        self._unverified_retries.pop(name, None)
+        for prefix in ('smart:', 'temperature:', 'udisks:'):
+            self.sources.pop(prefix + name, None)
+            self.errors.pop(prefix + name, None)
+
+    def _prepare_devices(self, devices):
+        nodes = {d['name']: d for d in devices if d.get('type') == 'disk' and not d['name'].startswith('zram')}
+        identities = {name: self._identity_reader(name, node) for name, node in nodes.items()}
+        evidence = list(identities.values())
+        for name, identity in list(identities.items()):
+            if sum(other.diskseq == identity.diskseq for other in evidence) > 1 and identity.diskseq is not None:
+                identities[name] = DeviceIdentity(error='Sesión de dispositivo ambigua')
+            elif identity.physical and sum(other.physical == identity.physical for other in evidence) > 1:
+                identities[name] = DeviceIdentity(error='Identidad física duplicada')
+        old = self._bindings.copy()
+        bindings = {}
+        moved = set()
+        for name, identity in identities.items():
+            previous = old.get(name)
+            if previous and previous.identity == identity:
+                bindings[name] = previous
+                continue
+            if previous and previous.identity.same_attachment(identity):
+                updated = Presence(previous.identity.enriched(identity), previous.generation)
+                if self._udisks:
+                    self._udisks.rebind(previous, updated)
+                bindings[name] = updated
+                continue
+            if previous and identity.error:
+                self._topology_at = None
+            candidates = [(other, binding) for other, binding in old.items()
+                          if other not in nodes and other not in moved and identity.cacheable
+                          and binding.identity.same_attachment(identity)]
+            if len(candidates) == 1:
+                other, binding = candidates[0]
+                self._clear_thermal(name)
+                updated = Presence(binding.identity.enriched(identity), binding.generation)
+                if self._udisks:
+                    self._udisks.rebind(binding, updated)
+                for cache in (self._temperature_cache, self._selected_temperatures,
+                              self._temperature_sources, self._unverified_retries):
+                    if other in cache:
+                        value = cache.pop(other)
+                        if cache is self._selected_temperatures:
+                            value = (value[0], value[1].split(':', 1)[0] + ':' + name)
+                        elif cache is self._temperature_sources:
+                            value = value.split(':', 1)[0] + ':' + name
+                        cache[name] = value
+                for mapping in (self.sources, self.errors):
+                    for prefix in ('smart:', 'temperature:', 'udisks:'):
+                        if prefix + other in mapping:
+                            mapping[prefix + name] = mapping.pop(prefix + other)
+                bindings[name] = updated
+                moved.add(other)
+            else:
+                self._clear_thermal(name)
+                self._generation += 1
+                bindings[name] = Presence(identity, self._generation)
+        for name in old.keys() - nodes.keys() - moved:
+            self._clear_thermal(name)
+        self._bindings = bindings
+        self._device_nodes = nodes
+        self.thermal_generations = {prefix + name: binding.generation for name, binding in bindings.items()
+                                    for prefix in ('smart:', 'temperature:', 'udisks:')}
+        if self._udisks:
+            self._udisks.prepare({binding for binding in bindings.values()
+                                  if binding.identity.cacheable and binding.identity.physical})
+
+    def _temperature(self, name):
+        if name not in self._bindings:
+            self._prepare_devices([{'name': name, 'type': 'disk'}])
+        binding = self._bindings[name]
+        if binding.identity.error in ('Sesión de dispositivo ambigua', 'Identidad física duplicada'):
+            self._clear_thermal(name)
+            key = 'temperature:' + name
+            self.errors[key] = binding.identity.error
+            self.sources[key] = SourceState(error=binding.identity.error)
+            self._temperature_sources[name] = key
+            return None
+        before = self._identity_reader(name, self._device_nodes[name])
+        if not before.usable or (before != binding.identity and not binding.identity.same_attachment(before)):
+            self._clear_thermal(name)
+            if before != binding.identity:
+                self._bindings.pop(name, None)
+                self._topology_at = None
+            message = before.error or 'Identidad térmica no verificable o sesión cambiada'
+            self.errors['temperature:' + name] = message
+            self.sources['temperature:' + name] = SourceState(error=message)
+            self._temperature_sources[name] = 'temperature:' + name
+            return None
+        if before.cacheable:
+            value = self._read_temperature(name)
+        else:
+            # Without an attachment token, only freshly bracketed direct readings
+            # are eligible. Do not reuse values, errors or wall-clock anchors.
+            retry = self._unverified_retries.get(name, 0)
+            self._clear_thermal(name)
+            started = self._clock()
+            value = self._nvme_temperature(name) if name.startswith('nvme') else self._drivetemp_temperature(name)
+            if value is not None and math.isfinite(value):
+                key = 'temperature:' + name
+                self.sources[key] = SourceState(started, self._clock(), freshness(self.refresh_interval))
+                self._temperature_sources[name] = key
+            elif self._clock() >= retry:
+                value = self._smart_temperature(name)
+                self._temperature_sources[name] = 'smart:' + name
+                retry = self._temperature_cache.get(name, (self._clock() + self.temperature_interval,))[0]
+                self._temperature_cache.pop(name, None)
+            else:
+                value = None
+            self._unverified_retries[name] = retry
+        after = self._identity_reader(name, self._device_nodes[name])
+        if not after.usable or (after != before and not before.same_attachment(after)):
+            self._clear_thermal(name)
+            self._bindings.pop(name, None)
+            self._topology_at = None
+            key = 'temperature:' + name
+            message = 'La identidad o sesión cambió durante la adquisición térmica'
+            self.errors[key] = message
+            self.sources[key] = SourceState(error=message)
+            self._temperature_sources[name] = key
+            return None
+        return value
+
     # ---- public ---------------------------------------------------------
 
     def build_metrics(self, devices: list) -> list:
+        self._prepare_devices(devices)
         disks = []
         for d in devices:
             name = str(d.get("name") or "")

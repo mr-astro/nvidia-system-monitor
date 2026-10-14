@@ -9,6 +9,7 @@ from unittest import mock
 from src.data.storage import StorageMonitor
 from src.data.errors import SourceState, freshness
 from src.data.udisks import TemperatureReading
+from src.data.identity import DeviceIdentity
 
 LSBLK = {"blockdevices": [
     {"name": "zram0", "type": "disk", "size": 8589934592, "model": None, "tran": None,
@@ -42,6 +43,9 @@ SCSI = "Current Drive Temperature:     30 C\n"
 
 def fake_monitor(**kwargs):
     kwargs.setdefault("udisks", False)
+    kwargs.setdefault('sys_dir', '/synthetic/missing-sysfs')
+    kwargs.setdefault('identity_reader', lambda name, node: DeviceIdentity(
+        diskseq=sum(map(ord, name)) + 1, serial='synthetic-' + name, model='synthetic'))
     with mock.patch("shutil.which", return_value=None):
         return StorageMonitor(**kwargs)
 
@@ -372,9 +376,11 @@ class TemperatureSelection(unittest.TestCase):
     def setUp(self):
         self.now = [100.0]
         self.reading = TemperatureReading(40, SourceState(95, 95, 752))
-        self.provider = types.SimpleNamespace(read=mock.Mock(side_effect=lambda name: self.reading))
+        self.provider = types.SimpleNamespace(read=mock.Mock(side_effect=lambda name, context=None: self.reading),
+                                              invalidate=mock.Mock(), prepare=mock.Mock(), rebind=mock.Mock())
         self.monitor = fake_monitor(udisks=self.provider, clock=lambda: self.now[0], sys_dir='/nonexistent')
         self.monitor._smartctl = '/usr/bin/smartctl'
+        self.monitor._prepare_devices([{'name': 'sda', 'type': 'disk'}])
 
     def test_udisks_valid_avoids_smartctl_and_preserves_permission_diagnostic(self):
         self.monitor.sources['smart:sda'] = SourceState(max_age=15, error='Permission denied')
@@ -396,7 +402,7 @@ class TemperatureSelection(unittest.TestCase):
     def test_udisks_expiring_during_dbus_call_still_evaluates_fallback(self):
         self.now[0] = 4
 
-        def delayed(name):
+        def delayed(name, context=None):
             self.now[0] = 6
             return TemperatureReading(40, SourceState(0, 0, 5))
 
