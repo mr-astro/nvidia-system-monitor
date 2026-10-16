@@ -1,7 +1,8 @@
-"""Channel launchers: no-follow directory traversal and atomic publication.
+"""Per-user channel resources: no-follow traversal and atomic file publication.
 
 Descriptors pin the selected directories even if a parent path is replaced.
 This is not a security boundary against malicious processes with the same UID.
+Each file is published atomically; the installation is not a joint transaction.
 """
 from __future__ import annotations
 
@@ -17,6 +18,8 @@ import subprocess
 import sys
 
 from src.utils.channel import DEFAULT_CHANNEL, get_channel, parse_channel_args
+
+CACHE_TIMEOUT = 3
 
 
 class UnsafeDestination(ValueError):
@@ -57,13 +60,14 @@ def regular_destination(descriptor, name):
     return info
 
 
-def read_destination(descriptor, name):
+def read_destination(descriptor, name, *, binary=False):
     info = regular_destination(descriptor, name)
     if info is None:
         return None
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                  dir_fd=descriptor)
-    with os.fdopen(fd, 'r', encoding='utf-8') as stream:
+    options = {} if binary else {'encoding': 'utf-8'}
+    with os.fdopen(fd, 'rb' if binary else 'r', **options) as stream:
         actual = os.fstat(stream.fileno())
         if (actual.st_dev, actual.st_ino) != (info.st_dev, info.st_ino):
             raise UnsafeDestination(f"Destino cambió durante la lectura: {name}")
@@ -102,7 +106,8 @@ def publish(descriptor, name, content, *, preserve=False):
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
                  | os.O_CLOEXEC, 0o600, dir_fd=descriptor)
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        options = {} if isinstance(content, bytes) else {'encoding': 'utf-8'}
+        with os.fdopen(fd, 'wb' if isinstance(content, bytes) else 'w', **options) as stream:
             stream.write(content)
             stream.flush()
             os.fchmod(stream.fileno(), 0o644)
@@ -139,68 +144,95 @@ def refresh_database(descriptor):
         # Pin the directory for this optional cache refresh as well.
         try:
             subprocess.run([command, f'/proc/self/fd/{descriptor}'], pass_fds=(descriptor,),
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        except OSError:
-            pass  # As before, a failed optional cache refresh is not fatal.
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False, timeout=CACHE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # Publication already succeeded; optional caches are best effort.
+
+
+def source_payloads(app_dir, channel):
+    """Read every required source before publishing any destination."""
+    app_dir = Path(app_dir)
+    if not app_dir.is_absolute() or any(c in str(app_dir) for c in '"`$\\%\n\r'):
+        raise UnsafeDestination('Ruta del proyecto no soportada por Exec')
+
+    def read(relative, *, binary=False):
+        source = app_dir / relative
+        with directory_fd(source.parent) as descriptor:
+            content = read_destination(descriptor, source.name, binary=binary)
+        if content is None:
+            raise FileNotFoundError(f'Fuente ausente: {source}')
+        return content
+
+    template = read(channel.desktop_id + '.in').replace('@APP_DIR@', str(app_dir))
+    if not launcher_channel(template, channel):
+        raise UnsafeDestination('La plantilla debe seleccionar su canal explícitamente')
+    fields = dict(line.split('=', 1) for line in template.splitlines() if '=' in line)
+    if fields.get('Icon') != channel.icon_name:
+        raise UnsafeDestination('La plantilla debe seleccionar el icono de su canal')
+    read('bin/system_monitor.py')
+    config = read('config.json.example')
+    icon = read('assets/icons/cl.mastro.NvidiaSystemMonitor.png', binary=True)
+    return template, config, icon
 
 
 def run(app_dir, channel_name=DEFAULT_CHANNEL, *, action='install'):
     channel = get_channel(channel_name)
     apps, config = locations(channel)
-    name = channel.desktop_id  # No caller-provided filename or destination.
-    template = None
-    if action in ('install', 'validate'):
-        app_dir = Path(app_dir)
-        if not app_dir.is_absolute() or any(c in str(app_dir) for c in '"`$\\%\n\r'):
-            raise UnsafeDestination('Ruta del proyecto no soportada por Exec')
-        template = (app_dir / (name + '.in')).read_text().replace('@APP_DIR@', str(app_dir))
-        if not launcher_channel(template, channel):
-            raise UnsafeDestination('La plantilla debe seleccionar su canal explícitamente')
-    if action == 'validate':
-        for path, filename in ((apps, name), (config, 'config.json')):
+    icons = apps.parent / 'icons/hicolor/scalable/apps'
+    name = channel.desktop_id  # No caller-provided filenames.
+    icon_name = channel.icon_name + '.png'
+    if action not in ('install', 'uninstall', 'check', 'validate'):
+        raise ValueError(f'Acción no válida: {action}')
+    payloads = source_payloads(app_dir, channel) if action in ('install', 'validate') else None
+    with contextlib.ExitStack() as stack:
+        # Pin and validate ALL selected destinations before the first write or
+        # deletion. Missing directories are harmless for read-only/uninstall.
+        def open_directory(path):
             try:
-                with directory_fd(path) as descriptor:
-                    if path == apps:
-                        existing = read_destination(descriptor, filename)
-                        if existing is not None:
-                            launcher_channel(existing, channel)
-                    else:
-                        regular_destination(descriptor, filename)
+                return stack.enter_context(directory_fd(path, create=action == 'install'))
             except FileNotFoundError:
-                pass
-        return 0
-    try:
-        with directory_fd(apps, create=action == 'install') as apps_fd:
-            existing = read_destination(apps_fd, name)
-            explicit = launcher_channel(existing, channel) if existing is not None else None
-            if action == 'check':
-                if existing is None:
-                    print(f'Launcher ausente: {apps / name}')
-                    return 0
-                if channel.name == 'dev' and not explicit:
-                    print(f'Launcher DEV antiguo: {apps / name}; regenérelo con --channel dev')
-                    return 3
+                if action == 'install':
+                    raise
+                return None
+
+        apps_fd = open_directory(apps)
+        existing = read_destination(apps_fd, name) if apps_fd is not None else None
+        explicit = launcher_channel(existing, channel) if existing is not None else None
+        if action == 'check':
+            if existing is None:
+                print(f'Launcher ausente: {apps / name}')
+            elif channel.name == 'dev' and not explicit:
+                print(f'Launcher DEV antiguo: {apps / name}; regenérelo con --channel dev')
+                return 3
+            else:
                 print(f'Launcher compatible: {apps / name}')
-                return 0
-            if action == 'uninstall':
-                if existing is not None:
-                    regular_destination(apps_fd, name)
-                    os.unlink(name, dir_fd=apps_fd)
-                refresh_database(apps_fd)
-                print(f'Lanzador eliminado: {apps / name}')
-                return 0
-            with directory_fd(config, create=True) as config_fd:
-                regular_destination(config_fd, 'config.json')
-                publish(config_fd, 'config.json', (app_dir / 'config.json.example').read_text(), preserve=True)
-                publish(apps_fd, name, template)
-                refresh_database(apps_fd)
-                print(f'Lanzador instalado: {apps / name}')
-                return 0
-    except FileNotFoundError:
-        if action in ('check', 'uninstall'):
-            print(f'Launcher ausente: {apps / name}')
             return 0
-        raise
+
+        icons_fd = open_directory(icons)
+        if icons_fd is not None:
+            regular_destination(icons_fd, icon_name)
+        if action == 'uninstall':
+            for descriptor, filename in ((apps_fd, name), (icons_fd, icon_name)):
+                if descriptor is not None and regular_destination(descriptor, filename) is not None:
+                    os.unlink(filename, dir_fd=descriptor)
+            if apps_fd is not None:
+                refresh_database(apps_fd)
+            print(f'Launcher e icono eliminados para {channel.name}; preferencias conservadas')
+            return 0
+
+        config_fd = open_directory(config)
+        if config_fd is not None:
+            regular_destination(config_fd, 'config.json')
+        if action == 'validate':
+            return 0
+        template, config_content, icon = payloads
+        publish(config_fd, 'config.json', config_content, preserve=True)
+        publish(icons_fd, icon_name, icon)
+        publish(apps_fd, name, template)
+        refresh_database(apps_fd)
+        print(f'Launcher e icono instalados para {channel.name}: {apps / name}')
+        return 0
 
 
 def main(argv=None):

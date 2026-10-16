@@ -14,6 +14,10 @@ class Channel:
     def desktop_id(self) -> str:
         return self.application_id + ".desktop"
 
+    @property
+    def icon_name(self) -> str:
+        return self.application_id
+
 
 STABLE = Channel("stable", "cl.mastro.NvidiaSystemMonitor", "NVIDIA System Monitor",
                  "nvidia-system-monitor", "nvidia-system-monitor")

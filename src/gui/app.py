@@ -184,7 +184,7 @@ class SystemMonitorApp(Gtk.Application):
     def _build_window(self) -> None:
         self.window = Gtk.ApplicationWindow(application=self)
         self.window.set_title(self.channel.title)
-        self.window.set_icon_name("cl.mastro.NvidiaSystemMonitor")
+        self.window.set_icon_name(self.channel.icon_name)
         self.window.set_default_size(1000, 720)
         self.window.set_size_request(380, 320)
 

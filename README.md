@@ -5,9 +5,10 @@
 Monitor de escritorio GTK4 para Linux (desarrollado y probado en Fedora): GPU NVIDIA, CPU, RAM y almacenamiento, con sensores opcionales.
 
 Este README describe el código de esta rama. El canal selecciona identidad y rutas;
-no cambia de versión ni integra esta rama en `main`. A2, A3, A4, A5 y A6 de la
-auditoría siguen pendientes antes de integrar a estable; el ajuste del instalador
-para separar canales pertenece a A1 y no resuelve el resto de A5.
+no cambia de versión ni integra esta rama en `main`. A1, A2, A3, A6 y A7 están
+resueltos. Esta corrección completa el instalador por usuario de A4; A5 sigue
+parcialmente pendiente antes de preparar una publicación estable. No se crea una
+versión ni una etiqueta Git con este cambio.
 
 ## Qué monitoriza
 
@@ -106,8 +107,9 @@ segunda instancia del mismo canal activa la existente. El canal `stable` conserv
 la identidad de las instalaciones anteriores, por lo que puede activar una
 instancia estable ya abierta: use `--channel dev` para trabajar en esta rama.
 
-El instalador fuente permite añadir al menú un launcher por canal y copiar la
-configuración de ejemplo solo si no existe:
+El instalador fuente añade al menú un launcher y un icono independientes por canal,
+y copia la configuración de ejemplo solo si no existe. No ejecuta `sudo` ni escribe
+recursos globales. Los comandos siguientes se muestran desde la raíz del repositorio:
 
 ```bash
 ./install.sh --channel dev
@@ -120,11 +122,30 @@ configuración de ejemplo solo si no existe:
 Estos comandos modifican la instalación si se ejecutan. El launcher DEV es
 `cl.mastro.NvidiaSystemMonitor.Dev.desktop`; el estable conserva
 `cl.mastro.NvidiaSystemMonitor.desktop`. Las plantillas nuevas indican su canal explícitamente.
-DEV no reemplaza el launcher, configuración ni icono de estable. El icono visual
-se comparte por nombre; si no está instalado, el entorno puede mostrar un icono
-genérico. El instalador estable conserva la copia del icono a `/usr/share/icons`
-mediante `sudo`, incluida su comprobación al desinstalar; esa parte de A5 sigue
-pendiente. Los comandos mostrados deben ejecutarse desde la raíz del repositorio.
+DEV no reemplaza el launcher, configuración ni icono de estable. Ambos canales
+conservan el mismo diseño gráfico, con archivos instalados distintos:
+
+| Recurso | `stable` | `dev` |
+|---|---|---|
+| Launcher en `applications/` | `cl.mastro.NvidiaSystemMonitor.desktop` | `cl.mastro.NvidiaSystemMonitor.Dev.desktop` |
+| PNG en `icons/hicolor/scalable/apps/` | `cl.mastro.NvidiaSystemMonitor.png` | `cl.mastro.NvidiaSystemMonitor.Dev.png` |
+
+Estas rutas se encuentran bajo `XDG_DATA_HOME`, o `~/.local/share` si la variable
+está vacía o no es absoluta. El PNG existente del repositorio se copia sin alterar
+su diseño. GTK encuentra ambos iconos mediante el tema `hicolor`, sin necesitar
+una actualización global de cachés. El icono histórico de `/usr/share/icons` no se
+sobrescribe ni se elimina; el recurso estable del usuario tiene prioridad.
+
+También puede invocar `"/ruta/con espacios/al/repositorio/install.sh" --channel dev`
+desde otro directorio. El script ancla la importación del helper a su propio
+repositorio, incluso si el directorio actual contiene otro paquete `src`. Se admiten
+espacios en la ruta; se rechazan comillas dobles, acentos graves, `$`, `\`, `%` y
+saltos de línea por las reglas de `Exec` del launcher.
+
+El launcher ejecuta el código de ese checkout mediante una ruta absoluta; no se
+copia el programa a otra ubicación. Mantenga checkouts separados para DEV y estable.
+Tras mover un checkout, repita la instalación del canal correspondiente para
+actualizar su ruta. Una actualización conserva configuración, alias y registros.
 
 **Migración de launchers DEV anteriores:** los instalados antes de esta separación
 pueden carecer de `--channel dev`. Con el nuevo valor predeterminado iniciarían
@@ -135,7 +156,7 @@ Primero ejecute `./install.sh --channel dev --check-launcher`. Es una comprobaci
 de solo lectura: devuelve 0 si está compatible o ausente, 3 si detecta un launcher
 DEV antiguo y 2 si rechaza una ruta, enlace o contenido inseguro. La regeneración
 se solicita después mediante `./install.sh --channel dev`; reemplaza únicamente
-el archivo DEV y conserva la configuración existente. El cambio de `Exec` es:
+el launcher e icono DEV y conserva la configuración existente. El cambio de `Exec` es:
 
 ```diff
 -Exec=python3 "RUTA_DEL_REPOSITORIO/bin/system_monitor.py"
@@ -146,15 +167,34 @@ La ruta real del repositorio se conserva al regenerar desde ese mismo repositori
 El launcher estable no necesita migración para mantener su funcionamiento histórico.
 La comprobación no instala ni regenera archivos automáticamente.
 
+Para actualizar instalaciones anteriores, vuelva a ejecutar el instalador con el
+canal explícito desde el checkout que quiera utilizar. Esto publica el icono por
+usuario del canal sin alterar el icono global ni los recursos del otro canal.
+No es necesario borrar preferencias ni migrar sus directorios.
+
+La desinstalación elimina únicamente el launcher y el icono por usuario del canal.
+No necesita las plantillas, el PNG fuente ni el ejemplo de configuración, aunque
+el script y sus módulos Python deben seguir disponibles. Conserva configuración,
+alias, registros, el checkout y el icono global histórico. Pueden quedar directorios
+vacíos y metadatos de caché del escritorio; no se borran directorios compartidos.
+
 El helper `src/utils/installer.py` valida el canal de la plantilla y del launcher
 existente, y obtiene el nombre de destino de la definición central de canales.
+Antes de publicar valida todas las fuentes necesarias (plantilla, punto de entrada,
+configuración de ejemplo e icono) y todos los destinos seleccionados.
 Rechaza enlaces simbólicos (también colgantes), archivos con enlaces duros y
 directorios padres enlazados, tanto al instalar como al desinstalar. La instalación
 recorre los directorios con `O_NOFOLLOW`, conserva sus descriptores abiertos y
-reemplaza el launcher por un archivo temporal del mismo directorio mediante
+reemplaza el launcher y el icono por archivos temporales del mismo directorio mediante
 renombrado atómico. La configuración inicial se publica sin sobrescribir un
 archivo que aparezca concurrentemente. La desinstalación usa `unlink` relativo al
 descriptor y nunca sigue el enlace final.
+
+La actualización de `update-desktop-database`, si está disponible, espera como
+máximo tres segundos; su ausencia, error o timeout no invalida la publicación.
+Si una escritura falla, se eliminan sus temporales; pueden quedar archivos
+completos ya publicados y directorios creados. Corrija la causa y repita el comando:
+la configuración existente se conserva. No hay rollback conjunto de los recursos.
 
 Esto evita escribir a través de enlaces y redirigir operaciones mediante una
 sustitución de directorios padres. Si un directorio abierto se renombra durante

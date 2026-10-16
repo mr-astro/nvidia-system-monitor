@@ -1,5 +1,23 @@
 # Cambios
 
+## Sin publicar — A4
+
+- Instalación y desinstalación por usuario sin `sudo` ni escrituras globales.
+  Launchers e iconos independientes para DEV y estable bajo `XDG_DATA_HOME`;
+  se conserva el diseño del PNG y el icono global histórico no se toca.
+- Helper anclado al checkout, compatible con Python 3.10 y con rutas con espacios,
+  independientemente del directorio actual o de un paquete `src` ajeno.
+- Fuentes y destinos comprobados antes de publicar, también para iconos, con
+  recorrido `O_NOFOLLOW`, descriptores de directorio y rechazo de enlaces duros.
+  Publicación atómica por archivo y limpieza de temporales ante fallos parciales.
+- Desinstalación sin depender de plantillas, PNG ni configuración de ejemplo;
+  conserva preferencias, alias, registros y recursos del otro canal.
+- Caché de launchers opcional con límite de tres segundos; su fallo no invalida
+  los archivos publicados. Pruebas aisladas de instalación, actualización,
+  desinstalación, enlaces, rutas, cachés e identidades e iconos GTK por canal.
+- Documentada la migración de recursos existentes, sin asignar una nueva versión
+  de la aplicación ni crear etiquetas Git. A5 continúa parcialmente pendiente.
+
 ## 3.1.0
 
 Sobre el repositorio publicado (commit `435a799`). Se conservan sus decisiones: tema

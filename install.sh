@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Instala (o desinstala) el lanzador de escritorio para el usuario actual.
 #   ./install.sh [--channel dev|stable]              instala el canal (stable por defecto)
-#   ./install.sh [--channel dev|stable] --uninstall  elimina su .desktop, conserva configuración
+#   ./install.sh [--channel dev|stable] --uninstall  elimina launcher e icono, conserva preferencias
 #   ./install.sh --channel dev --check-launcher     comprueba sin modificar la instalación
 
 set -euo pipefail
@@ -42,40 +42,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# All launcher/config writes use pinned directory descriptors in the helper.
-run_helper() {
-    PYTHONPATH="$APP_DIR" python3 -B -m src.utils.installer \
-        --app-dir "$APP_DIR" --channel "$CHANNEL" --action "$1"
-}
-
-if [[ "$ACTION" == check ]]; then
-    run_helper check
-    exit $?
-fi
-
-# Reject unsafe destinations before the historical stable icon operations.
-# The actual operation reopens and revalidates every destination afterwards.
-run_helper validate
-
-# The shared installed icon belongs to the historical stable installation.
-# DEV references it, but must never replace it or update the global icon cache.
-if [[ "$CHANNEL" == stable ]]; then
-    # Ruta del icono en el repositorio
-    ICON_SOURCE="assets/icons/cl.mastro.NvidiaSystemMonitor.png"
-
-    # Ruta de destino en el sistema
-    ICON_DEST="/usr/share/icons/hicolor/scalable/apps/cl.mastro.NvidiaSystemMonitor.png"
-
-    # Copiar el icono
-    if [ -f "$ICON_SOURCE" ]; then
-        sudo cp "$ICON_SOURCE" "$ICON_DEST"
-        sudo gtk-update-icon-cache /usr/share/icons/hicolor/
-        echo "Icono instalado correctamente."
-    else
-        echo "Error: No se encontró el icono en $ICON_SOURCE"
-        exit 1
-    fi
-fi
-
-run_helper "$ACTION"
+APP_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# Python 3.10's -m prepends the working directory to sys.path. Anchor it to
+# this checkout so a caller's unrelated src package cannot replace the helper.
+cd -- "$APP_DIR"
+PYTHONPATH="$APP_DIR" exec python3 -B -m src.utils.installer \
+    --app-dir "$APP_DIR" --channel "$CHANNEL" --action "$ACTION"

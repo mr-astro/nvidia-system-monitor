@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def probe(channel, directory):
-    from gi.repository import GLib
+    from gi.repository import GLib, Gtk
     from src.gui.app import SystemMonitorApp
 
     root = Path(directory)
@@ -25,12 +25,16 @@ def probe(channel, directory):
         raise RuntimeError('Channel did not acquire its own GTK identity')
     app._build_window()
     app.window.present()
+    icon = Gtk.IconTheme.get_for_display(app.window.get_display()).lookup_icon(
+        app.channel.icon_name, [], 48, 1, Gtk.TextDirection.NONE, Gtk.IconLookupFlags.FORCE_REGULAR)
     app.logger.info('%s_PROCESS_ONLY', channel.upper())
     for handler in app.logger.handlers:
         handler.flush()
     (root / (channel + '.ready')).write_text(json.dumps({
         'id': app.get_application_id(), 'remote': app.get_is_remote(),
         'title': app.window.get_title(), 'config': str(app.config.path),
+        'icon': app.window.get_icon_name(),
+        'icon_file': icon.get_file().get_path() if icon.get_file() else None,
         'aliases': str(app.disk_aliases.config_path),
         'interval': app.interval, 'logger': app.logger.name,
         'log': app.logger.handlers[0].baseFilename,
@@ -98,6 +102,10 @@ class ConcurrentChannels(unittest.TestCase):
             root = Path(directory)
             preserved = {}
             for channel, interval in ((STABLE, 1), (DEV, 3)):
+                icons = root / 'data/icons/hicolor/scalable/apps'
+                icons.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / 'assets/icons/cl.mastro.NvidiaSystemMonitor.png',
+                                icons / (channel.icon_name + '.png'))
                 config = root / 'config' / channel.directory_name
                 config.mkdir(parents=True)
                 config_file = config / 'config.json'
@@ -109,7 +117,8 @@ class ConcurrentChannels(unittest.TestCase):
                 aliases.write_text('{"aliases":{"wwn-example-A":"Synthetic"}}')
                 for path in (config_file, aliases):
                     preserved[path] = (path.read_bytes(), path.stat().st_mtime_ns)
-            env = dict(os.environ, XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'))
+            env = dict(os.environ, HOME=str(root / 'home'), XDG_DATA_HOME=str(root / 'data'),
+                       XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'))
             result = subprocess.run([
                 'dbus-run-session', '--', sys.executable, '-B', '-m',
                 'tests.test_channels_gui', '--coordinator', directory,
@@ -121,6 +130,9 @@ class ConcurrentChannels(unittest.TestCase):
                 self.assertEqual(observed['id'], channel.application_id)
                 self.assertFalse(observed['remote'])
                 self.assertEqual(observed['title'], channel.title)
+                self.assertEqual(observed['icon'], channel.icon_name)
+                self.assertEqual(Path(observed['icon_file']),
+                                 root / 'data/icons/hicolor/scalable/apps' / (channel.icon_name + '.png'))
                 self.assertEqual(observed['interval'], interval)
                 self.assertEqual(observed['logger'], channel.logger_name)
                 self.assertEqual(Path(observed['config']), root / 'config' / channel.directory_name / 'config.json')

@@ -28,6 +28,7 @@ class Channels(unittest.TestCase):
         self.assertEqual(STABLE.directory_name, 'nvidia-system-monitor')
         self.assertEqual(STABLE.logger_name, 'nvidia-system-monitor')
         self.assertEqual(STABLE.desktop_id, 'cl.mastro.NvidiaSystemMonitor.desktop')
+        self.assertEqual(STABLE.icon_name, 'cl.mastro.NvidiaSystemMonitor')
 
     def test_dev_identity_is_independent(self):
         self.assertIs(get_channel('dev'), DEV)
@@ -36,6 +37,7 @@ class Channels(unittest.TestCase):
         self.assertEqual(DEV.directory_name, 'nvidia-system-monitor-dev')
         self.assertNotEqual(DEV.logger_name, STABLE.logger_name)
         self.assertNotEqual(DEV.desktop_id, STABLE.desktop_id)
+        self.assertEqual(DEV.icon_name, 'cl.mastro.NvidiaSystemMonitor.Dev')
         for value in ('DEV', '', None, 'production'):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 get_channel(value)
@@ -146,6 +148,7 @@ class ChannelArguments(unittest.TestCase):
                 fields = dict(line.split('=', 1) for line in
                               (ROOT / (channel.desktop_id + '.in')).read_text().splitlines() if '=' in line)
                 self.assertEqual(fields['Name'], channel.title)
+                self.assertEqual(fields['Icon'], channel.icon_name)
                 selected, forwarded = parse_channel_args(shlex.split(fields['Exec'])[1:])
                 self.assertEqual(selected, channel)
                 self.assertEqual(forwarded, ['@APP_DIR@/bin/system_monitor.py'])
