@@ -23,6 +23,8 @@ from src.data.ram import RamMetrics
 from src.data.sensors import SensorReading
 from src.data.storage import DiskMetrics, PartitionMetrics
 from src.data.errors import SourceState, freshness
+from src.data.storage_presentation import StoragePresentation
+from src.utils.disk_aliases import DiskIdentity
 
 
 def full_snapshot(n_gpus=1):
@@ -38,6 +40,7 @@ def full_snapshot(n_gpus=1):
         ram=RamMetrics(total_mb=16000, used_mb=8000, available_mb=8000, free_mb=2000,
                        cached_mb=6000, usage_percent=50.0, swap_total_mb=4096,
                        swap_used_mb=100, swap_usage_percent=2.4),
+        storage_presentation=StoragePresentation(identities=(("nvme0n1", DiskIdentity("synthetic:nvme0n1")),)),
         disks=[DiskMetrics(name="nvme0n1", kind="NVMe", size_bytes=10 ** 12, temperature_c=38.0,
                            partitions=[PartitionMetrics(
                                name="nvme0n1p2", size_bytes=10 ** 12, fstype="btrfs",
@@ -61,8 +64,10 @@ class GuiSmoke(unittest.TestCase):
         import json
         path.write_text(json.dumps({"logging_enabled": False, **overrides}))
         app = SystemMonitorApp(Config(path))
-        from src.utils.disk_aliases import DiskAliasResolver
-        app.disk_aliases = DiskAliasResolver(Path(tmp.name) / "aliases.json", Path(tmp.name) / "by-id")
+        from src.data.storage_presentation import StorageAliasWorker
+        app.disk_aliases = StorageAliasWorker(Path(tmp.name) / "aliases.json", Path(tmp.name) / "by-id")
+        app.collector.storage_aliases = app.disk_aliases if 'storage' in app.enabled else None
+        self.addCleanup(app.disk_aliases.stop)
         # Each fixture exports its own D-Bus object, including when the host
         # already has the real monitor open. Keep the production ID unchanged.
         app.set_application_id(f"cl.mastro.NvidiaSystemMonitor.Test{next(self._application_ids)}")
@@ -359,6 +364,32 @@ class GuiSmoke(unittest.TestCase):
             app._on_tick()
             self.assertIs(app.cards["gpu"]._rows["state"][1], stale_label)
             self.assertIn("hace 6 s", stale_label.get_label())
+
+    def test_a6_tick_ignores_old_snapshot_and_keeps_aging_latest(self):
+        app = self._app()
+        current = full_snapshot()
+        current.sequence, current.timestamp = 10, 100
+        current.sources = {'usage:nvme0n1p2': SourceState(100, 100, 2)}
+        old = Snapshot(sequence=9)
+        with mock.patch.object(app.collector, 'latest', side_effect=[current, old]):
+            with mock.patch('src.gui.app.time.monotonic', return_value=101):
+                app._on_tick()
+            card = next(iter(app.cards['storage'].disk_cards.values()))
+            with mock.patch('src.gui.app.time.monotonic', return_value=105):
+                app._on_tick()
+        self.assertEqual(app._last_sequence, 10)
+        self.assertIs(app._last_snapshot, current)
+        self.assertIs(next(iter(app.cards['storage'].disk_cards.values())), card)
+        self.assertIn('hace 5 s', card.usage_warning.get_label())
+
+    def test_a6_app_construction_and_render_do_not_construct_alias_resolver(self):
+        with mock.patch('src.utils.disk_aliases.DiskAliasResolver.__init__',
+                        side_effect=AssertionError('resolver construction on GTK')):
+            app = self._app()
+            self.assertIsNone(app.disk_aliases._thread)
+            app._render(full_snapshot())
+            self.assertNotIn('storage', app._last_render_error)
+            self.assertIsNone(app.disk_aliases._thread)
 
     def test_storage_stale_values_remain_visible_with_age(self):
         app = self._app()

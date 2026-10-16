@@ -5,12 +5,15 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import threading
 from unittest import mock
 
 from src.data.identity import DeviceIdentity, probe, sequence
 from src.data.storage import StorageMonitor
 from src.data.udisks import ATA, BLOCK, UDisksTemperature
 from src.data.collector import Collector
+from src.data.storage_presentation import StorageAliasWorker
+from src.utils.disk_aliases import DiskIdentity
 
 DRIVE = 'org.freedesktop.UDisks2.Drive'
 
@@ -129,6 +132,54 @@ class ThermalIdentity(unittest.TestCase):
             self.assertNotIn('usage:sda', self.monitor.errors)
             self.assertEqual(self.monitor.sources['usage:sda'].acquired_at, 103)
             self.assertEqual(first.direct_filesystem.used_bytes, 600 * 4096)
+
+    def test_a6_slow_aliases_preserve_a2_sources_sessions_and_a3_usage_errors(self):
+        entered, release = threading.Event(), threading.Event()
+        class SlowResolver:
+            error = None
+            def __init__(self, *args, **kwargs):
+                pass
+            def refresh(self, devices, generation):
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError('synthetic alias I/O')
+                return {d.name: DiskIdentity('id:wwn-500a') for d in devices}
+        worker = StorageAliasWorker('/synthetic/aliases.json', resolver_factory=SlowResolver,
+                                    identity_reader=lambda name: self.live[name])
+        self.addCleanup(worker.stop)
+        self.addCleanup(release.set)
+        self.nodes[0].update(fstype='ext4', mountpoints=['/synthetic/mount'])
+        mounts = {'/synthetic/mount': ('10', '8:0', '/', 'ext4', '/dev/sda')}
+        self.monitor._read_mountinfo.side_effect = lambda: dict(mounts)
+        collector = Collector(storage=self.monitor, storage_aliases=worker, clock=lambda: self.now[0])
+        stat = SimpleNamespace(f_blocks=1000, f_bfree=400, f_bavail=300, f_frsize=4096)
+        with mock.patch('src.data.storage.os.statvfs', return_value=stat) as statvfs:
+            first = collector.collect_once()
+            self.assertTrue(entered.wait(2))
+            binding = self.monitor._bindings['sda']
+            temperature = first.sources['smart:sda']
+            self.now[0] = 101
+            statvfs.side_effect = OSError('synthetic statvfs error')
+            failed = collector.collect_once()
+            self.assertEqual(failed.disks[0].direct_filesystem.used_bytes, 600*4096)
+            self.assertIn('usage:sda', failed.errors)
+            self.assertEqual(failed.sources['usage:sda'].acquired_at, 100)
+            self.now[0] = 102
+            mounts.clear()
+            unmounted = collector.collect_once()
+            self.assertIsNone(unmounted.disks[0].direct_filesystem.used_bytes)
+            for snap in (failed, unmounted):
+                self.assertEqual(snap.disks[0].temperature_c, 38)
+                self.assertEqual(snap.disks[0].temperature_source, 'smart:sda')
+                self.assertIs(snap.sources['smart:sda'], temperature)
+            self.assertEqual(temperature.age(102), 2)
+            self.assertEqual(self.monitor._bindings['sda'], binding)
+            self.assertEqual(self.run.call_count, 1)
+            self.assertEqual(first.disks[0].direct_filesystem.used_bytes, 600*4096)
+        worker.stop()
+        release.set()
+        worker._thread.join(2)
+        self.assertFalse(worker._thread.is_alive())
 
     def test_cached_topology_cannot_authorize_new_attachment(self):
         self.monitor.topology_interval = 15

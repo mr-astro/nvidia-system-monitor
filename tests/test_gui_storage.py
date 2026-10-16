@@ -2,6 +2,8 @@
 import json
 import tempfile
 import unittest
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -10,7 +12,9 @@ from tests.test_gui_smoke import HAVE_GTK, full_snapshot
 from src.data.collector import Snapshot
 from src.data.storage import DiskMetrics, PartitionMetrics
 from src.data.errors import SourceState
-from src.utils.disk_aliases import DiskAliasResolver
+from src.utils.disk_aliases import DiskIdentity
+from src.data.storage_presentation import StoragePresentation, StorageAliasWorker, presentation_request
+from src.data.identity import DeviceIdentity, Presence
 
 
 @unittest.skipUnless(HAVE_GTK, 'GTK 4 o pantalla no disponibles')
@@ -25,21 +29,30 @@ class StorageGui(unittest.TestCase):
         self.devices.mkdir()
         self.by_id.mkdir()
         self.config = self.root / 'aliases.json'
-        self.resolver = DiskAliasResolver(self.config, self.by_id, self.devices)
-        self.panel = StoragePanel(self.resolver)
+        self.identifiers = {}
+        self.configured_aliases = {}
+        self.panel = StoragePanel()
 
     def identify(self, name, identifier):
         (self.devices / name).touch()
         (self.by_id / identifier).symlink_to(self.devices / name)
+        self.identifiers[name] = identifier
 
     def aliases(self, aliases):
         self.config.write_text(json.dumps({'aliases': aliases}))
+        self.configured_aliases = dict(aliases)
 
     def card(self, name):
         return next(card for card in self.panel.disk_cards.values() if name in card.technical.get_label().split(' · '))
 
     def snapshot(self, *disks, generation=0):
-        return Snapshot(sequence=generation + 1, disks=list(disks), sources={'topology': SourceState(generation, generation, 20)})
+        identities = tuple((d.name, DiskIdentity(
+            'synthetic:' + self.identifiers.get(d.name, d.name),
+            self.configured_aliases.get(self.identifiers.get(d.name)),
+            self.identifiers.get(d.name))) for d in disks)
+        return Snapshot(sequence=generation + 1, disks=list(disks),
+                        sources={'topology': SourceState(generation, generation, 20)},
+                        storage_presentation=StoragePresentation(identities=identities))
 
     def test_one_card_per_disk_collapsed_by_default_and_models_override_aliases(self):
         self.identify('sda', 'wwn-example-A')
@@ -78,7 +91,8 @@ class StorageGui(unittest.TestCase):
         self.assertIs(first, self.card('sdc'))
         self.assertTrue(first.expander.get_expanded())
         self.assertEqual(first.title.get_label(), 'Kingston')
-        self.assertEqual(self.resolver.refresh([other, disk], (2, (('sdb', 'N/D', None), ('sdc', 'Kingston', None))))['sdc'].alias, 'Respaldo')
+        prepared = self.snapshot(other, disk, generation=2).storage_presentation
+        self.assertEqual(dict(prepared.identities)['sdc'].alias, 'Respaldo')
 
     def test_hotplug_and_partition_changes_keep_expander(self):
         disk = DiskMetrics('sda', partitions=[PartitionMetrics('sda1')])
@@ -538,6 +552,146 @@ class StorageGui(unittest.TestCase):
             self.assertTrue(card.expander.get_expanded())
         self.assertEqual(len(card.partition_rows), 1)
         self.assertEqual(len(self.panel.disk_cards), 1)
+
+    def test_a6_prepared_aliases_rename_reconnect_and_replacement_keep_correct_expansion(self):
+        disk = DiskMetrics('sda', model='Synthetic')
+        def snap(sequence, key, physical):
+            return Snapshot(sequence=sequence, disks=[disk], storage_presentation=StoragePresentation(
+                identities=((disk.name, DiskIdentity(key, expansion_key=physical)),)))
+        self.panel.update(snap(1, 'presence:1', 'physical:A'), 0)
+        first = self.card('sda')
+        first.expander.set_expanded(True)
+        ready = snap(2, 'presence:1', 'physical:A')
+        ready.storage_presentation = StoragePresentation(identities=(('sda', DiskIdentity(
+            'presence:1', 'Ready alias', 'physical:A')),))
+        self.panel.update(ready, 1)
+        self.assertIs(first, self.card('sda'))
+        self.assertTrue(first.expander.get_expanded())
+        disk.name = 'sdc'
+        self.panel.update(snap(3, 'presence:1', 'physical:A'), 2)
+        self.assertIs(first, self.card('sdc'))
+        self.panel.update(snap(4, 'presence:2', 'physical:A'), 3)
+        reconnected = self.card('sdc')
+        self.assertIsNot(first, reconnected)
+        self.assertTrue(reconnected.expander.get_expanded())
+        self.panel.update(snap(5, 'presence:3', 'physical:B'), 4)
+        self.assertFalse(self.card('sdc').expander.get_expanded())
+        self.panel.update(Snapshot(sequence=6), 5)
+        self.assertEqual(self.panel.disk_cards, {})
+        self.panel.update(snap(7, 'presence:4', 'physical:A'), 6)
+        self.assertTrue(self.card('sdc').expander.get_expanded())
+
+    def test_a6_old_snapshot_is_rejected_while_current_usage_age_advances(self):
+        current = self.direct_snapshot()
+        current.sequence = 10
+        self.panel.update(current, 1)
+        card = self.card('sdb')
+        old = self.snapshot(DiskMetrics('sda'))
+        old.sequence = 9
+        self.panel.update(old, 5)
+        self.assertIs(card, self.card('sdb'))
+        self.assertEqual(len(self.panel.disk_cards), 1)
+        self.assertIn('hace 5 s', card.usage_warning.get_label())
+        self.assertIn('75,0%', card.usage.get_label())
+
+    def test_a6_unverified_names_do_not_inherit_expansion_or_accumulate_old_states(self):
+        disk = DiskMetrics('sda')
+        self.panel.update(Snapshot(sequence=1, disks=[disk]), 0)
+        card = self.card('sda')
+        card.expander.set_expanded(True)
+        for sequence in range(2, 102):
+            self.panel.update(Snapshot(sequence=sequence, disks=[disk]), sequence)
+            self.assertFalse(self.card('sda').expander.get_expanded())
+        self.assertIsNot(self.card('sda'), card)
+        self.assertEqual(len(self.panel.expansion_state), 1)
+
+    def test_a6_alias_error_is_separate_from_usage_temperature_and_their_times(self):
+        snap = self.direct_snapshot()
+        disk = snap.disks[0]
+        disk.temperature_c = 38
+        disk.temperature_source = 'smart:sdb'
+        snap.sources['smart:sdb'] = SourceState(0, 0, 15)
+        measurements = dict(snap.sources)
+        snap.storage_presentation = StoragePresentation(identities=snap.storage_presentation.identities,
+                                                        state=SourceState(0, 0, 20, 'JSON denied'))
+        self.panel.update(snap, 3)
+        card = self.card('sdb')
+        self.assertIn('JSON denied', self.panel._rows['alias-error'][1].get_tooltip_text())
+        self.assertIn('hace 3 s', self.panel._rows['alias-error'][1].get_tooltip_text())
+        self.assertEqual(snap.sources, measurements)
+        self.assertIn('38,0 °C', card.temperature.get_label())
+        self.assertTrue(card.usage_bar.get_visible())
+        self.assertIn('75,0%', card.usage.get_label())
+
+    def test_a6_gtk_stress_has_no_alias_io_with_worker_blocked(self):
+        from gi.repository import GLib
+        from src.gui.storage import StoragePanel
+
+        entered, release = threading.Event(), threading.Event()
+        main = threading.get_ident()
+        class SlowResolver:
+            error = None
+            def __init__(self, *args, **kwargs):
+                if threading.get_ident() == main:
+                    raise AssertionError('resolver constructed on GTK')
+            def refresh(self, devices, generation):
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError('synthetic slow JSON/symlink')
+                return {d.name: DiskIdentity('id:wwn-500a', 'Alias') for d in devices}
+        identity = DeviceIdentity(diskseq=1, wwn='500a')
+        worker = StorageAliasWorker('/synthetic/aliases.json', resolver_factory=SlowResolver,
+                                    identity_reader=lambda name: identity)
+        self.addCleanup(worker.stop)
+        self.addCleanup(release.set)
+        disk = DiskMetrics('sda', model='Synthetic')
+        req = presentation_request([disk], SourceState(0, 0, 20), {'sda': Presence(identity, 1)})
+        worker.request(req, 1)
+        self.assertTrue(entered.wait(2))
+        durations, beats = [], []
+        loop = GLib.MainLoop()
+        errors = []
+        with mock.patch.object(Path, 'read_text', side_effect=AssertionError('GTK JSON I/O')), \
+                mock.patch.object(Path, 'iterdir', side_effect=AssertionError('GTK device discovery')), \
+                mock.patch.object(Path, 'resolve', side_effect=AssertionError('GTK link resolution')), \
+                mock.patch.object(Path, 'is_symlink', side_effect=AssertionError('GTK path check')):
+            panel = StoragePanel()
+            snapshot = Snapshot(sequence=1, disks=[disk], storage_presentation=worker.request(req, 1))
+            panel.update(snapshot, 0)
+            card = next(iter(panel.disk_cards.values()))
+            card.expander.set_expanded(True)
+            def publish():
+                try:
+                    sequence = len(durations) + 2
+                    publication = Snapshot(sequence=sequence, disks=[disk],
+                                           storage_presentation=worker.request(req, sequence))
+                    started = time.perf_counter()
+                    panel.update(publication, sequence / 1000)
+                    durations.append(time.perf_counter()-started)
+                    self.assertIs(next(iter(panel.disk_cards.values())), card)
+                    self.assertTrue(card.expander.get_expanded())
+                    if len(durations) < 1000:
+                        return GLib.SOURCE_CONTINUE
+                except BaseException as error:
+                    errors.append(error)
+                loop.quit()
+                return GLib.SOURCE_REMOVE
+            heartbeat = GLib.timeout_add(5, lambda: (beats.append(time.perf_counter()), GLib.SOURCE_CONTINUE)[1])
+            GLib.idle_add(publish)
+            loop.run()
+            GLib.source_remove(heartbeat)
+        release.set()
+        worker.stop()
+        worker._thread.join(2)
+        if errors:
+            raise errors[0]
+        self.assertEqual(len(durations), 1000)
+        self.assertGreater(len(beats), 1)
+        self.assertLess(max(durations), .1)
+        self.assertFalse(worker._thread.is_alive())
+        print(f'A6 GTK stress: 1000 publications, update max={max(durations)*1000:.3f} ms, '
+              f'mean={sum(durations)/len(durations)*1000:.3f} ms, '
+              f'heartbeat gap max={max(b-a for a,b in zip(beats, beats[1:]))*1000:.3f} ms')
 
 
 if __name__ == '__main__':

@@ -21,6 +21,7 @@ _PREFIXES = ("wwn-", "nvme-eui.", "nvme-uuid.", "ata-", "nvme-", "scsi-", "usb-"
 class DiskIdentity:
     key: str
     alias: str | None = None
+    expansion_key: str | None = None
 
 
 def valid_id(value):
@@ -59,7 +60,6 @@ class DiskAliasResolver:
         """A generation is the existing topology acquisition time plus disk names."""
         if generation == self._generation:
             return self._identities
-        self._generation = generation
         self.error = None
         aliases = self._aliases()
         by_device = {}
@@ -93,4 +93,5 @@ class DiskAliasResolver:
             key = "id:" + identifiers[0] if identifiers and unique else "device:" + disk.name
             identities[disk.name] = DiskIdentity(key, alias)
         self._identities = identities
+        self._generation = generation
         return identities

@@ -97,6 +97,14 @@ class DiskAliases(unittest.TestCase):
         with mock.patch.object(Path, 'iterdir', side_effect=AssertionError('unexpected scan')):
             self.resolver.refresh([DiskMetrics('sda')], 1)
 
+    def test_unexpected_scan_failure_does_not_commit_an_incomplete_generation(self):
+        self.link('wwn-example-A', 'sda')
+        with mock.patch.object(Path, 'iterdir', side_effect=RuntimeError('synthetic interrupted scan')):
+            with self.assertRaises(RuntimeError):
+                self.resolver.refresh([DiskMetrics('sda')], 1)
+        identity = self.resolver.refresh([DiskMetrics('sda')], 1)['sda']
+        self.assertEqual(identity.key, 'id:wwn-example-A')
+
     def test_xdg_user_configs_and_stable_are_independent(self):
         with mock.patch.dict('os.environ', {'XDG_CONFIG_HOME': str(self.root / 'user-a')}):
             first = DiskAliasResolver(channel='dev').config_path

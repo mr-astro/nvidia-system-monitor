@@ -22,7 +22,7 @@ from src.data.sensors import SensorMonitor  # noqa: E402
 from src.data.storage import StorageMonitor  # noqa: E402
 from src.gui.widgets import MetricCard, _set_text
 from src.gui.storage import StoragePanel, STORAGE_CSS
-from src.utils.disk_aliases import DiskAliasResolver
+from src.data.storage_presentation import StorageAliasWorker
 from src.utils.channel import DEFAULT_CHANNEL, STABLE, get_channel
 from src.utils.config import Config  # noqa: E402
 from src.utils.formatting import (  # noqa: E402
@@ -98,7 +98,7 @@ class SystemMonitorApp(Gtk.Application):
         self.channel = get_channel(channel)
         super().__init__(application_id=self.channel.application_id)
         self.config = config or Config(channel=channel)
-        self.disk_aliases = DiskAliasResolver(channel=channel)
+        self.disk_aliases = StorageAliasWorker(channel=channel)
         self.logger = setup_logging(bool(self.config.get("logging_enabled", True)), channel=channel)
 
         panels = self.config.get("panels", {})
@@ -118,12 +118,14 @@ class SystemMonitorApp(Gtk.Application):
             sensors=SensorMonitor() if "sensors" in self.enabled else None,
             interval=self.interval,
             logger=self.logger,
+            storage_aliases=self.disk_aliases if "storage" in self.enabled else None,
         )
 
         self.window = None
         self.status = None
         self.cards: dict = {}
         self._last_sequence = 0
+        self._last_snapshot = Snapshot()
         self._last_age_render = None
         self._last_render_error: dict = {}
         self._render_attempts: dict = {}
@@ -149,7 +151,7 @@ class SystemMonitorApp(Gtk.Application):
         )
 
     def do_shutdown(self):
-        self.collector.stop()
+        self.collector.stop(timeout=0)
         Gtk.Application.do_shutdown(self)
 
     # ---- construction ---------------------------------------------------
@@ -250,7 +252,7 @@ class SystemMonitorApp(Gtk.Application):
 
     def _new_card(self, name):
         if name == "storage":
-            return StoragePanel(self.disk_aliases, self.unit, self.medium, self.high)
+            return StoragePanel(self.unit, self.medium, self.high)
         return MetricCard(PANEL_TITLES[name])
 
     # ---- update loop ----------------------------------------------------
@@ -259,6 +261,10 @@ class SystemMonitorApp(Gtk.Application):
         if self.window is None:
             return GLib.SOURCE_REMOVE
         snapshot = self.collector.latest()
+        if snapshot.sequence < self._last_sequence:
+            snapshot = self._last_snapshot
+        else:
+            self._last_snapshot = snapshot
         second = int(time.monotonic())
         if snapshot.sequence and (snapshot.sequence != self._last_sequence or second != self._last_age_render):
             self._last_sequence = snapshot.sequence
@@ -353,6 +359,8 @@ class SystemMonitorApp(Gtk.Application):
                     if name == "storage":
                         target.disk_cards = card.disk_cards
                         target.expansion_state = card.expansion_state
+                        target._expansion_keys = card._expansion_keys
+                        target._last_snapshot = card._last_snapshot
                 self._last_render_error.pop(name, None)
             except Exception as exc:  # a rendering bug must not kill the loop
                 message = f"{type(exc).__name__}: {exc}"

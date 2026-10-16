@@ -640,6 +640,11 @@ class StorageMonitor:
 
     # ---- public ---------------------------------------------------------
 
+    def presentation_bindings(self):
+        """Copy immutable A2 evidence without probing or changing any session."""
+        return {name: binding for name, binding in self._bindings.items()
+                if binding.identity.usable}
+
     def build_metrics(self, devices: list) -> list:
         self._prepare_devices(devices)
         disks = []

@@ -11,6 +11,7 @@ from gi.repository import Gtk, Pango
 
 from src.gui.widgets import MetricCard, _set_text, LEVEL_CLASSES
 from src.data.storage import NON_FILESYSTEM_TYPES
+from src.utils.disk_aliases import DiskIdentity
 from src.utils.formatting import fmt_bytes, fmt_temp, usage_level
 
 STORAGE_CSS = """
@@ -315,23 +316,36 @@ class DiskCard(Gtk.Box):
 
 
 class StoragePanel(MetricCard):
-    def __init__(self, resolver, unit="C", medium=60, high=85):
+    def __init__(self, unit="C", medium=60, high=85):
         super().__init__("Almacenamiento")
         self.remove_css_class("hw-card")
         self.add_css_class("storage-panel")
-        self.resolver = resolver
         self.unit, self.medium, self.high = unit, medium, high
         self.disk_cards = {}
         self.expansion_state = {}
+        self._expansion_keys = {}
+        self._last_snapshot = None
+
+    def _remember_expansion(self, key, card):
+        expanded = card.expander.get_expanded()
+        self.expansion_state[key] = expanded
+        physical = self._expansion_keys.get(key)
+        if physical is not None:
+            self.expansion_state[physical] = expanded
 
     def reset(self, signature):
         if signature != self._signature:
             for key, card in self.disk_cards.items():
-                self.expansion_state[key] = card.expander.get_expanded()
+                self._remember_expansion(key, card)
             super().reset(signature)
             self.disk_cards.clear()
+            self._expansion_keys.clear()
 
     def update(self, snap, now):
+        if self._last_snapshot is not None and snap.sequence < self._last_snapshot.sequence:
+            snap = self._last_snapshot
+        else:
+            self._last_snapshot = snap
         if not snap.disks:
             self.reset(("storage-empty",))
             error = snap.errors.get("topology") or snap.errors.get("storage")
@@ -339,32 +353,39 @@ class StoragePanel(MetricCard):
             self._rows["state"][1].set_tooltip_text(error)
             return
         self.reset(("storage",))
-        topology = snap.sources.get("topology")
-        generation = (topology.acquired_at if topology else None,
-                      tuple((disk.name, disk.model, disk.size_bytes) for disk in snap.disks))
-        identities = self.resolver.refresh(snap.disks, generation)
+        presentation = snap.storage_presentation
+        identities = dict(presentation.identities) if presentation else {}
+        alias_error = presentation.state.error if presentation else None
+        for key, card in self.disk_cards.items():
+            self._remember_expansion(key, card)
         active = set()
         previous = None
-        if self.resolver.error:
+        if alias_error:
             self.set_row("alias-error", "Alias", "Configuración o identidad no disponible")
-            self._rows["alias-error"][1].set_tooltip_text(self.resolver.error)
+            self._rows["alias-error"][1].set_tooltip_text(state_detail(presentation.state, now))
             previous = self._rows["alias-error"][0].get_parent().get_parent()
         elif "alias-error" in self._rows:
             container = self._rows.pop("alias-error")[0].get_parent().get_parent()
             self.body.remove(container)
-        for disk in snap.disks:
-            identity = identities[disk.name]
+        for position, disk in enumerate(snap.disks):
+            identity = identities.get(disk.name, DiskIdentity(f"unverified:{snap.sequence}:{position}:{disk.name}"))
             key = identity.key
             active.add(key)
             card = self.disk_cards.get(key)
             if card is None:
-                card = self.disk_cards[key] = DiskCard(key, self.expansion_state.get(key, False))
+                card = self.disk_cards[key] = DiskCard(key, self.expansion_state.get(
+                    identity.expansion_key or key, False))
                 self.body.append(card)
+            self._expansion_keys[key] = identity.expansion_key
             self.body.reorder_child_after(card, previous)
             previous = card
             card.update(disk, identity.alias, snap, now, self.unit, self.medium, self.high)
-            self.expansion_state[key] = card.expander.get_expanded()
+            self._remember_expansion(key, card)
         for key in set(self.disk_cards) - active:
             card = self.disk_cards.pop(key)
-            self.expansion_state[key] = card.expander.get_expanded()
+            self._remember_expansion(key, card)
+            self._expansion_keys.pop(key, None)
             self.body.remove(card)
+        for key in list(self.expansion_state):
+            if key.startswith(('presence:', 'unverified:')) and key not in active:
+                self.expansion_state.pop(key)

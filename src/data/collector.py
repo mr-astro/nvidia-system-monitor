@@ -14,6 +14,7 @@ from typing import Optional
 from src.data.errors import SourceState, freshness
 from src.data.cpu import CpuMetrics
 from src.data.ram import RamMetrics
+from src.data.storage_presentation import StoragePresentation, presentation_request
 
 ERROR_LOG_INTERVAL = 60.0
 
@@ -32,6 +33,7 @@ class Snapshot:
     errors: dict = field(default_factory=dict)
     sources: dict = field(default_factory=dict)
     acquisition_started_at: float = 0.0
+    storage_presentation: Optional[StoragePresentation] = None
 
 
 class Collector:
@@ -48,6 +50,7 @@ class Collector:
         sensors_interval: float = 5.0,
         logger=None,
         clock=time.monotonic,
+        storage_aliases=None,
     ):
         self.cpu = cpu
         self.gpu = gpu
@@ -60,6 +63,7 @@ class Collector:
         self.sensors_interval = sensors_interval
         self.logger = logger
         self._clock = clock
+        self.storage_aliases = storage_aliases
 
         self._lock = threading.Lock()
         self._snapshot = Snapshot()
@@ -79,11 +83,15 @@ class Collector:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
+        if self.storage_aliases is not None:
+            self.storage_aliases.start()
         self._thread = threading.Thread(target=self._run, name="hw-collector", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float = 3.0) -> None:
         self._stop.set()
+        if self.storage_aliases is not None:
+            self.storage_aliases.stop()
         if self._thread is not None:
             self._thread.join(timeout)
 
@@ -181,6 +189,10 @@ class Collector:
                     if key == "topology" or key.startswith(("usage:", "smart:", "temperature:", "udisks:")):
                         self._states.pop(key)
                 self._states.update(states)
+            if self.storage_aliases is not None:
+                bindings = self.storage.presentation_bindings()
+                request = presentation_request(snap.disks, self._states.get('topology'), bindings)
+                snap.storage_presentation = self.storage_aliases.request(request, snap.sequence)
         if self.sensors is not None:
             now = self._clock()
             if self._sensors_at is None or now - self._sensors_at >= self.sensors_interval:
