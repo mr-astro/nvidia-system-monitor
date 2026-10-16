@@ -1,6 +1,26 @@
 # Cambios
 
-## Sin publicar — A4
+## 3.2.0 — 2026-10-15
+
+Versión aprobada y notas finalizadas en DEV. La integración en `main`, la etiqueta
+y la release estable siguen pendientes de autorización y no se han ejecutado.
+Los antecedentes 3.0.0 y 3.1.0 se conservan; este cierre no los renumera.
+
+### Estado de la auditoría
+
+- A1, A2, A3, A4, A5, A6 y A7 están resueltos en código según las auditorías.
+- A5 queda cerrado sin cambios funcionales: A1 y A4 ya separan IDs GTK,
+  configuración, alias, registros, launchers e iconos de DEV y estable. Se
+  verificaron 94 pruebas relacionadas sin fallos ni omisiones, además de rotación
+  efectiva de logs y trabajadores simultáneos con datos sintéticos.
+- Se mantienen las correcciones de A2 para identidad física, sesiones y antigüedad
+  térmica; A3 para uso de sistemas de archivos en discos completos; y A6 para
+  resolver alias fuera del hilo GTK y del colector de hardware.
+- La preparación final actualiza únicamente README y CHANGELOG. La versión 3.2.0
+  está aprobada; la instalación real, integración en `main`, etiqueta y release
+  requieren autorizaciones posteriores.
+
+### Instalador por usuario (A4)
 
 - Instalación y desinstalación por usuario sin `sudo` ni escrituras globales.
   Launchers e iconos independientes para DEV y estable bajo `XDG_DATA_HOME`;
@@ -16,7 +36,27 @@
   los archivos publicados. Pruebas aisladas de instalación, actualización,
   desinstalación, enlaces, rutas, cachés e identidades e iconos GTK por canal.
 - Documentada la migración de recursos existentes, sin asignar una nueva versión
-  de la aplicación ni crear etiquetas Git. A5 continúa parcialmente pendiente.
+  de la aplicación ni crear etiquetas Git.
+
+### Documentación de publicación
+
+- Corregidas las referencias a hallazgos pendientes y al hilo único: el trabajador
+  de alias es independiente. Documentado el uso de sistemas de archivos directos.
+- Instrucciones explícitas de instalación, comprobación y desinstalación de ambos
+  canales como usuario normal; los comandos administrativos solo gestionan
+  dependencias del sistema o el módulo opcional `drivetemp`.
+- Versión 3.2.0 aprobada y etiqueta futura propuesta `v3.2.0`, con comprobaciones,
+  integración en un clon independiente, despliegue y reversión sin modificar el
+  worktree estable protegido. La validación sigue siendo manual, sin workflow CI.
+
+### Validación de preparación (2026-10-15)
+
+- Suite completa: **335 pruebas aprobadas, cero fallos y cero omisiones**, bajo
+  Xvfb y D-Bus con HOME/XDG temporales. Fedora Linux 44, Python 3.14.8, GTK 4.22.5;
+  base de código `c77de5e` y cambios únicamente documentales.
+- `git diff --check`, `bash -n install.sh` y validación de las dos plantillas
+  `.desktop` con rutas con espacios: correctos. La instalación real queda pendiente
+  de autorización; no se modifican `main` ni el worktree estable.
 
 ## 3.1.0
 
@@ -54,8 +94,10 @@ documentación.
   almacenamiento a todo el ancho, sin los huecos que dejaba la cuadrícula.
 - **Panel de sensores opcional** (`panels.sensors`, desactivado por defecto).
 - Tamaños de fuente en porcentaje (respetan la escala de texto del sistema).
-- **CI en GitHub Actions** (`.github/workflows/tests.yml`): ejecuta la suite completa,
-  incluida la GUI bajo Xvfb, en cada `push`.
+- **Aclaración sobre CI:** la documentación de 3.1.0 mencionaba
+  `.github/workflows/tests.yml`, pero el historial Git disponible no contiene ese
+  workflow. No existe CI activa en esta rama; la suite se valida manualmente bajo
+  Xvfb y D-Bus.
 - 15 pruebas nuevas, entre ellas una por cada regresión anterior (CUDA, intervalo, colores,
   CSS sin errores de análisis, diseño).
 

@@ -5,10 +5,13 @@
 Monitor de escritorio GTK4 para Linux (desarrollado y probado en Fedora): GPU NVIDIA, CPU, RAM y almacenamiento, con sensores opcionales.
 
 Este README describe el código de esta rama. El canal selecciona identidad y rutas;
-no cambia de versión ni integra esta rama en `main`. A1, A2, A3, A6 y A7 están
-resueltos. Esta corrección completa el instalador por usuario de A4; A5 sigue
-parcialmente pendiente antes de preparar una publicación estable. No se crea una
-versión ni una etiqueta Git con este cambio.
+no cambia de versión ni integra esta rama en `main`. **A1–A7 están resueltos en
+código según las auditorías realizadas.** A5 quedó cerrado al comprobar que A1 y
+A4 ya separan los recursos mutables de DEV y estable; no necesita cambios
+funcionales adicionales. La comprobación de A5 ejecutó 94 pruebas relacionadas,
+sin fallos ni omisiones, y reproducciones temporales de rotación de logs y de
+trabajadores de alias simultáneos. La instalación real y la publicación estable
+requieren una aprobación posterior; este cierre documental no las ejecuta.
 
 ## Qué monitoriza
 
@@ -23,8 +26,11 @@ temperatura cuando existe `k10temp`, `zenpower` (AMD) o `coretemp` (Intel).
 
 **Almacenamiento**: cada disco físico con modelo, tipo (NVMe, SSD SATA, HDD, USB, eMMC/SD),
 capacidad y temperatura; debajo, sus particiones y volúmenes anidados (LUKS, LVM) con
-sistema de archivos, punto(s) de montaje y uso. Si un dispositivo tiene varios montajes
-(p. ej. subvolúmenes btrfs en `/` y `/home`), el uso mostrado es el del sistema de
+sistema de archivos, punto(s) de montaje y uso. Un sistema de archivos montado
+directamente sobre el disco completo muestra su utilización en la cabecera, sin
+crear una partición ficticia; su capacidad lógica permanece separada de la física.
+Si un dispositivo tiene varios montajes (p. ej. subvolúmenes btrfs en `/` y `/home`),
+el uso mostrado es el del sistema de
 archivos completo.
 
 **Sensores** (opcional, desactivado por defecto): lecturas de temperatura de `lm_sensors`,
@@ -109,13 +115,19 @@ instancia estable ya abierta: use `--channel dev` para trabajar en esta rama.
 
 El instalador fuente añade al menú un launcher y un icono independientes por canal,
 y copia la configuración de ejemplo solo si no existe. No ejecuta `sudo` ni escribe
-recursos globales. Los comandos siguientes se muestran desde la raíz del repositorio:
+recursos globales. Los comandos administrativos anteriores solo corresponden a
+paquetes del sistema y al módulo opcional `drivetemp`; no forman parte del
+instalador de la aplicación. Los comandos siguientes se muestran desde la raíz
+del repositorio y se ejecutan como usuario normal:
 
 ```bash
 ./install.sh --channel dev
 ./install.sh --channel dev --check-launcher     # comprobar sin escribir
 ./install.sh --channel dev --uninstall
 ./install.sh --channel stable
+./install.sh --channel stable --check-launcher
+./install.sh --channel stable --uninstall
+./install.sh                                   # instala stable por defecto
 ./install.sh --uninstall                       # stable por defecto
 ```
 
@@ -288,6 +300,15 @@ válida de otra fuente.
 Cada canal utiliza un logger y handlers propios, sin propagar mensajes al logger
 raíz. Su `monitor.log` es rotativo: 512 KiB más dos archivos de respaldo. Si no
 puede abrirse, el registro se desactiva sin impedir el inicio de la aplicación.
+Las cachés de mediciones y alias, los diagnósticos y el estado de expansión son
+propios de cada instancia y se mantienen en memoria. No hay una caché persistente
+propia compartida de mediciones o alias. Las bibliotecas, servicios de consulta y
+cachés regenerables de Python y del escritorio sí pueden compartirse; no contienen
+las preferencias ni los registros de ambos canales en un único archivo de la aplicación.
+El aislamiento por canal no es una barrera frente a procesos del mismo usuario:
+redirigir manualmente rutas o logs mediante enlaces puede anularlo. El instalador
+rechaza enlaces; la apertura de logs en ejecución utiliza las operaciones habituales
+del sistema de archivos.
 
 ## Pruebas
 
@@ -303,8 +324,9 @@ la pantalla virtual debe admitir la ventana de escritorio. Este comando fuerza X
 en sesiones Wayland y usa Cairo para evitar depender de aceleración en Xvfb:
 
 ```bash
-xvfb-run -a -s '-screen 0 1280x1024x24' \
-  env GDK_BACKEND=x11 GSK_RENDERER=cairo python3 -B -m unittest discover -s tests -t . -v
+dbus-run-session -- xvfb-run -a -s '-screen 0 1280x1024x24' \
+  env GDK_BACKEND=x11 GSK_RENDERER=cairo GTK_A11Y=none \
+  python3 -B -m unittest discover -s tests -t . -v
 ```
 
 En Fedora, las herramientas de pruebas se pueden instalar con:
@@ -319,6 +341,87 @@ sesión y directorios XDG temporales. Verifique que el resultado no tenga omisio
 para considerar completa la validación. Esta rama no contiene un workflow de
 GitHub Actions; la suite se ejecuta manualmente con los comandos anteriores.
 
+Validación de preparación del 15 de octubre de 2026, sobre `c77de5e` con cambios
+únicamente documentales: **335 pruebas aprobadas, cero fallos y cero omisiones**.
+Se ejecutó la suite completa bajo Xvfb y D-Bus con HOME/XDG temporales, en Fedora
+Linux 44, Python 3.14.8 y GTK 4.22.5. También pasaron `git diff --check`,
+`bash -n install.sh` y la validación de ambos `.desktop` con rutas con espacios.
+Esta ejecución no certifica por sí sola todas las versiones mínimas admitidas ni
+sustituye la prueba de instalación real pendiente de autorización.
+
+## Preparación de publicación estable
+
+**Versión aprobada: 3.2.0; notas finalizadas el 15 de octubre de 2026 en DEV.**
+La integración en `main`, la creación de la etiqueta y la release estable siguen
+pendientes de autorización. El historial documenta
+3.0.0 en el commit inicial `59ca107` y añade 3.1.0 en `2266242`. En la consulta de
+preparación del 15 de octubre de 2026 no había etiquetas Git locales o remotas ni
+[releases en GitHub](https://github.com/mr-astro/nvidia-system-monitor/releases).
+Son antecedentes documentales, no publicaciones etiquetadas que deban reconstruirse
+retroactivamente. El historial usa mensajes `fix:`, `feat:` y `docs:`, pero no
+establece una convención de etiquetas o una automatización de publicación.
+
+Se adopta 3.2.0 por las capacidades compatibles incorporadas desde 3.1.0:
+telemetría UDisks2, uso de sistemas de archivos en discos completos, canales
+independientes e instalador por usuario. Se conservan las rutas históricas estables
+y la lectura de configuración anterior. La futura etiqueta anotada `v3.2.0` sería
+una convención nueva; crearla y publicarla requiere autorización.
+`Version=1.0` en las plantillas `.desktop`
+identifica el formato Desktop Entry, no la versión de la aplicación.
+
+El siguiente procedimiento es un plan; no autoriza su ejecución automática:
+
+1. La versión 3.2.0 está aprobada y el changelog tiene su entrada fechada.
+   Tras publicar la documentación autorizada en DEV, registrar el hash candidato
+   y comprobar que el checkout está limpio antes de continuar con la migración.
+2. Antes de instalar DEV realmente, cerrar ambos monitores y guardar una copia
+   privada de los launchers e iconos existentes, anotando también cuáles no existen.
+   Registrar las rutas XDG efectivas y los hashes de configuración y alias por canal.
+   Comprobar destinos regulares y directorios físicos; detenerse ante enlaces o
+   contenido ajeno. El respaldo y cualquier instalación requieren autorización.
+3. Desde el checkout DEV aprobado, ejecutar
+   `./install.sh --channel dev --check-launcher`. Un código 3 identifica el launcher
+   antiguo y requiere regeneración; 2 exige revisar la causa. Con autorización,
+   ejecutar `./install.sh --channel dev` y repetir la comprobación. Validar el
+   `.desktop` generado con `desktop-file-validate` y su ruta absoluta, canal e icono.
+   Verificar que la instalación no cambió archivos estables ni preferencias existentes.
+4. Abrir DEV desde el menú y estable desde su instalación anterior. Comprobar títulos,
+   iconos, procesos e identidades GTK independientes, rutas de logs y ausencia de
+   mezcla entre registros. Verificar respuesta de la interfaz bajo carga y telemetría
+   disponible, sin montar ni alterar discos. Los logs pueden crecer por la ejecución
+   normal; la comparación de instalación del paso anterior se hace antes de abrirlos.
+   Para revertir DEV, cerrarlo y restaurar sus recursos previos desde el respaldo,
+   retirando únicamente los archivos nuevos que antes no existían. Si no había
+   instalación previa, usar `./install.sh --channel dev --uninstall`.
+   Conservar preferencias y logs. No utilizar
+   para revertir el instalador histórico que copiaba el icono global con `sudo`.
+5. Tras aprobar la prueba real, preparar la integración en un clon independiente;
+   `main` está asociado al worktree estable protegido, por lo que no debe moverse
+   en el repositorio compartido durante esta preparación. Verificar de nuevo las
+   ramas remotas y la ascendencia; actualmente `main` es antecesor de DEV. En ese
+   clon, con autorización, integrar el candidato mediante avance rápido
+   (`git merge --ff-only HASH_CANDIDATO`). Detenerse ante divergencias.
+6. Ejecutar la suite completa bajo Xvfb y D-Bus sobre el candidato integrado,
+   `git diff --check`, `bash -n install.sh` y la validación de ambos `.desktop`.
+   Exigir cero fallos y cero omisiones. Probar el canal estable del candidato con
+   HOME/XDG temporales y un bus de sesión separado para no activar la instalación
+   estable existente. Registrar Python, GTK, Fedora/GNOME, hardware y resultado.
+7. Con autorización de publicación, volver a comprobar el remoto y publicar solo
+   `main`, sin forzar. Verificar su hash. Después, si se autoriza el etiquetado,
+   crear y publicar únicamente su etiqueta anotada sobre ese mismo commit y crear
+   la release de GitHub. No mover etiquetas publicadas. Incluir el hash exacto,
+   cambios A1–A7, requisitos, instrucciones por canal, migración, pruebas y límites
+   conocidos. Si se adjunta un archivo de fuentes, publicar también su SHA-256.
+   Distribuir fuentes con licencia MIT; no anunciar RPM, Flatpak ni CI inexistentes.
+8. Instalar estable solo después de otra autorización, desde un checkout de la
+   versión fijada al hash publicado, manteniendo disponible la instalación anterior.
+   Ejecutar `./install.sh --channel stable`, comprobar el launcher y verificar la
+   convivencia con DEV. Si falla, cerrar estable y restaurar sus launchers e iconos
+   anteriores desde el respaldo sin borrar preferencias. Para revertir código ya
+   publicado, preparar un nuevo commit de reversión y validarlo; no reescribir
+   `main` ni desplazar la etiqueta. Cualquier actualización del worktree protegido
+   requiere autorización expresa y queda fuera de este plan de preparación.
+
 ## Diseño técnico
 
 ```
@@ -329,9 +432,11 @@ src/utils/              configuración, registro, rutas XDG y formato
 tests/                  pruebas unitarias y de humo de la GUI
 ```
 
-- Toda la recolección (subprocesos y lecturas de `/proc` y `/sys`) corre en **un único hilo
-en segundo plano**. El bucle de GTK solo lee la última instantánea y actualiza los
-widgets existentes, por lo que un `nvidia-smi` lento o colgado no congela la ventana.
+- La recolección de hardware (subprocesos y lecturas de `/proc` y `/sys`) corre en
+un hilo en segundo plano. La resolución de alias tiene un trabajador independiente
+por instancia, con una única solicitud pendiente reemplazable y resultados
+inmutables. Su lectura de JSON y enlaces no bloquea GTK ni la publicación de
+telemetría. El bucle de GTK lee instantáneas y actualiza los widgets existentes.
 - Cada fuente falla de forma aislada: si una falla, las demás siguen funcionando y el
 encabezado muestra un aviso (el detalle aparece al pasar el cursor).
 - La topología de discos (`lsblk`) se consulta cada 15 s; los sensores, cada 5 s.
