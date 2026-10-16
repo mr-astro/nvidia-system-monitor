@@ -4,14 +4,15 @@
 
 Monitor de escritorio GTK4 para Linux (desarrollado y probado en Fedora): GPU NVIDIA, CPU, RAM y almacenamiento, con sensores opcionales.
 
-Este README describe el código de esta rama. El canal selecciona identidad y rutas;
-no cambia de versión ni integra esta rama en `main`. **A1–A7 están resueltos en
+Este README describe NVIDIA System Monitor 3.2.0 integrado en `main`. El canal
+selecciona identidad y rutas; no cambia la versión. **A1–A7 están resueltos en
 código según las auditorías realizadas.** A5 quedó cerrado al comprobar que A1 y
 A4 ya separan los recursos mutables de DEV y estable; no necesita cambios
 funcionales adicionales. La comprobación de A5 ejecutó 94 pruebas relacionadas,
 sin fallos ni omisiones, y reproducciones temporales de rotación de logs y de
-trabajadores de alias simultáneos. La instalación real y la publicación estable
-requieren una aprobación posterior; este cierre documental no las ejecuta.
+trabajadores de alias simultáneos. La instalación local estable y la convivencia
+real con DEV ya se verificaron. La etiqueta `v3.2.0` y la GitHub Release siguen
+pendientes; este cierre actualiza únicamente la documentación.
 
 ## Qué monitoriza
 
@@ -111,7 +112,7 @@ deduce el canal de la rama Git, la ubicación del repositorio ni el usuario.
 Los canales usan IDs GTK diferentes y pueden ejecutarse simultáneamente. Una
 segunda instancia del mismo canal activa la existente. El canal `stable` conserva
 la identidad de las instalaciones anteriores, por lo que puede activar una
-instancia estable ya abierta: use `--channel dev` para trabajar en esta rama.
+instancia estable ya abierta: use `--channel dev` para seleccionar explícitamente DEV.
 
 El instalador fuente añade al menú un launcher y un icono independientes por canal,
 y copia la configuración de ejemplo solo si no existe. No ejecuta `sudo` ni escribe
@@ -346,81 +347,70 @@ Validación de preparación del 15 de octubre de 2026, sobre `c77de5e` con cambi
 Se ejecutó la suite completa bajo Xvfb y D-Bus con HOME/XDG temporales, en Fedora
 Linux 44, Python 3.14.8 y GTK 4.22.5. También pasaron `git diff --check`,
 `bash -n install.sh` y la validación de ambos `.desktop` con rutas con espacios.
-Esta ejecución no certifica por sí sola todas las versiones mínimas admitidas ni
-sustituye la prueba de instalación real pendiente de autorización.
+Este resultado histórico es anterior a la integración en `main`; no se ha
+registrado una nueva ejecución de la suite completa después de integrarla.
+Las comprobaciones de instalación y ejecución real se documentan por separado.
+No se certifican todas las versiones mínimas admitidas ni pruebas de carga GPU.
 
-## Preparación de publicación estable
+## Estado de v3.2.0 y reversión
 
-**Versión aprobada: 3.2.0; notas finalizadas el 15 de octubre de 2026 en DEV.**
-La integración en `main`, la creación de la etiqueta y la release estable siguen
-pendientes de autorización. El historial documenta
-3.0.0 en el commit inicial `59ca107` y añade 3.1.0 en `2266242`. En la consulta de
-preparación del 15 de octubre de 2026 no había etiquetas Git locales o remotas ni
-[releases en GitHub](https://github.com/mr-astro/nvidia-system-monitor/releases).
-Son antecedentes documentales, no publicaciones etiquetadas que deban reconstruirse
-retroactivamente. El historial usa mensajes `fix:`, `feat:` y `docs:`, pero no
-establece una convención de etiquetas o una automatización de publicación.
+**Versión aprobada: 3.2.0.** Las notas se finalizaron en DEV el 15 de octubre de
+2026; este cierre documental del 16 de octubre incorpora los hechos verificados
+tras la integración y la actualización local estable:
 
-Se adopta 3.2.0 por las capacidades compatibles incorporadas desde 3.1.0:
-telemetría UDisks2, uso de sistemas de archivos en discos completos, canales
-independientes e instalador por usuario. Se conservan las rutas históricas estables
-y la lectura de configuración anterior. La futura etiqueta anotada `v3.2.0` sería
-una convención nueva; crearla y publicarla requiere autorización.
-`Version=1.0` en las plantillas `.desktop`
-identifica el formato Desktop Entry, no la versión de la aplicación.
+- `main` recibió mediante fast-forward el commit
+  `2ffad3d1ad0b826e1a8dda146eae00b13aa8f8bc`.
+- La instalación local estable se actualizó de `4df03aa` a `2ffad3d`. Las acciones
+  `validate`, `install` y `check` del instalador estable pasaron correctamente.
+- El launcher estable apunta al checkout estable y selecciona explícitamente
+  `--channel stable`. El icono global histórico conservó su SHA-256.
+- DEV y estable se ejecutaron simultáneamente con las identidades D-Bus
+  `cl.mastro.NvidiaSystemMonitor.Dev` y `cl.mastro.NvidiaSystemMonitor`.
+  Ambas aplicaciones mostraron telemetría GPU coherente con `nvidia-smi`.
+- Los registros se verificaron en directorios XDG independientes:
+  `nvidia-system-monitor-dev` y `nvidia-system-monitor` bajo `XDG_STATE_HOME`,
+  o `~/.local/state` si la variable está vacía o no es absoluta.
+- La captura oficial `screenshot.png` se actualizó en `f4f5f99`; ese commit solo
+  modifica la imagen. No implica una nueva ejecución de pruebas automatizadas.
 
-El siguiente procedimiento es un plan; no autoriza su ejecución automática:
+La etiqueta `v3.2.0` y la GitHub Release quedan pendientes. La validación real
+registrada es funcional; no se documentan como completadas pruebas de carga GPU.
+La validación automatizada de referencia sigue siendo la de **335 pruebas**
+anterior a la integración.
 
-1. La versión 3.2.0 está aprobada y el changelog tiene su entrada fechada.
-   Tras publicar la documentación autorizada en DEV, registrar el hash candidato
-   y comprobar que el checkout está limpio antes de continuar con la migración.
-2. Antes de instalar DEV realmente, cerrar ambos monitores y guardar una copia
-   privada de los launchers e iconos existentes, anotando también cuáles no existen.
-   Registrar las rutas XDG efectivas y los hashes de configuración y alias por canal.
-   Comprobar destinos regulares y directorios físicos; detenerse ante enlaces o
-   contenido ajeno. El respaldo y cualquier instalación requieren autorización.
-3. Desde el checkout DEV aprobado, ejecutar
-   `./install.sh --channel dev --check-launcher`. Un código 3 identifica el launcher
-   antiguo y requiere regeneración; 2 exige revisar la causa. Con autorización,
-   ejecutar `./install.sh --channel dev` y repetir la comprobación. Validar el
-   `.desktop` generado con `desktop-file-validate` y su ruta absoluta, canal e icono.
-   Verificar que la instalación no cambió archivos estables ni preferencias existentes.
-4. Abrir DEV desde el menú y estable desde su instalación anterior. Comprobar títulos,
-   iconos, procesos e identidades GTK independientes, rutas de logs y ausencia de
-   mezcla entre registros. Verificar respuesta de la interfaz bajo carga y telemetría
-   disponible, sin montar ni alterar discos. Los logs pueden crecer por la ejecución
-   normal; la comparación de instalación del paso anterior se hace antes de abrirlos.
-   Para revertir DEV, cerrarlo y restaurar sus recursos previos desde el respaldo,
-   retirando únicamente los archivos nuevos que antes no existían. Si no había
-   instalación previa, usar `./install.sh --channel dev --uninstall`.
-   Conservar preferencias y logs. No utilizar
-   para revertir el instalador histórico que copiaba el icono global con `sudo`.
-5. Tras aprobar la prueba real, preparar la integración en un clon independiente;
-   `main` está asociado al worktree estable protegido, por lo que no debe moverse
-   en el repositorio compartido durante esta preparación. Verificar de nuevo las
-   ramas remotas y la ascendencia; actualmente `main` es antecesor de DEV. En ese
-   clon, con autorización, integrar el candidato mediante avance rápido
-   (`git merge --ff-only HASH_CANDIDATO`). Detenerse ante divergencias.
-6. Ejecutar la suite completa bajo Xvfb y D-Bus sobre el candidato integrado,
-   `git diff --check`, `bash -n install.sh` y la validación de ambos `.desktop`.
-   Exigir cero fallos y cero omisiones. Probar el canal estable del candidato con
-   HOME/XDG temporales y un bus de sesión separado para no activar la instalación
-   estable existente. Registrar Python, GTK, Fedora/GNOME, hardware y resultado.
-7. Con autorización de publicación, volver a comprobar el remoto y publicar solo
-   `main`, sin forzar. Verificar su hash. Después, si se autoriza el etiquetado,
-   crear y publicar únicamente su etiqueta anotada sobre ese mismo commit y crear
-   la release de GitHub. No mover etiquetas publicadas. Incluir el hash exacto,
-   cambios A1–A7, requisitos, instrucciones por canal, migración, pruebas y límites
-   conocidos. Si se adjunta un archivo de fuentes, publicar también su SHA-256.
-   Distribuir fuentes con licencia MIT; no anunciar RPM, Flatpak ni CI inexistentes.
-8. Instalar estable solo después de otra autorización, desde un checkout de la
-   versión fijada al hash publicado, manteniendo disponible la instalación anterior.
-   Ejecutar `./install.sh --channel stable`, comprobar el launcher y verificar la
-   convivencia con DEV. Si falla, cerrar estable y restaurar sus launchers e iconos
-   anteriores desde el respaldo sin borrar preferencias. Para revertir código ya
-   publicado, preparar un nuevo commit de reversión y validarlo; no reescribir
-   `main` ni desplazar la etiqueta. Cualquier actualización del worktree protegido
-   requiere autorización expresa y queda fuera de este plan de preparación.
+El historial documenta 3.0.0 en el commit inicial `59ca107` y añade 3.1.0 en
+`2266242`. Se conservan esos antecedentes sin renumerarlos ni crear etiquetas
+retroactivas. 3.2.0 incorpora telemetría UDisks2, uso de sistemas de archivos en
+discos completos, canales independientes e instalador por usuario, manteniendo
+las rutas históricas estables y la lectura de configuración anterior.
+`Version=1.0` en las plantillas `.desktop` identifica el formato Desktop Entry,
+no la versión de la aplicación.
+
+Para futuras actualizaciones o una recuperación, aplicar el siguiente procedimiento
+solo con autorización; este cierre documental no ejecuta instalaciones ni reversiones:
+
+1. Cerrar ambos monitores y verificar el respaldo privado previo: rutas XDG,
+   contenido, permisos y SHA-256 de los launchers e iconos, incluyendo sus ausencias.
+   Conservar las copias de configuración, alias y registros para consulta, sin
+   sobrescribir preferencias o logs actuales automáticamente.
+2. Para revertir recursos instalados, restaurar únicamente el launcher y el icono
+   del canal afectado. Si un archivo no existía antes, retirar solo ese archivo.
+   Usar descriptores de directorio sin seguir enlaces y publicación atómica por
+   archivo; rechazar enlaces o destinos inesperados. Mantener intactos el otro
+   canal y el icono global histórico. La recuperación no es una transacción conjunta.
+3. Restaurar un launcher no revierte el código de su checkout. El launcher estable
+   antiguo apuntaba al mismo directorio que ahora contiene el código actualizado;
+   para volver a ejecutar `4df03aa` se necesita un checkout separado fijado a ese
+   commit y un launcher con la ruta correcta, preparado y validado expresamente.
+   `4df03aa` no interpreta `--channel`: su launcher de recuperación debe omitir
+   esa opción y conservar la identidad estable histórica.
+   No ejecutar el instalador histórico con `sudo`, ni cambiar el checkout de una
+   aplicación abierta. Para revertir código publicado, preparar y validar un nuevo
+   commit de reversión; no reescribir `main` ni mover etiquetas publicadas.
+4. Validar el launcher recuperado y sus rutas antes de abrir la aplicación, comparar
+   los recursos del otro canal y comprobar la identidad D-Bus y el destino de logs.
+   Los registros pueden crecer legítimamente al ejecutar las aplicaciones.
+   Detenerse ante errores y conservar el respaldo hasta aceptar la recuperación.
 
 ## Diseño técnico
 

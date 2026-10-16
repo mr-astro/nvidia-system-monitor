@@ -2,8 +2,8 @@
 
 ## 3.2.0 — 2026-10-15
 
-Versión aprobada y notas finalizadas en DEV. La integración en `main`, la etiqueta
-y la release estable siguen pendientes de autorización y no se han ejecutado.
+Versión aprobada, integrada en `main` y verificada en la instalación local estable.
+La etiqueta `v3.2.0` y la GitHub Release siguen pendientes.
 Los antecedentes 3.0.0 y 3.1.0 se conservan; este cierre no los renumera.
 
 ### Estado de la auditoría
@@ -16,9 +16,9 @@ Los antecedentes 3.0.0 y 3.1.0 se conservan; este cierre no los renumera.
 - Se mantienen las correcciones de A2 para identidad física, sesiones y antigüedad
   térmica; A3 para uso de sistemas de archivos en discos completos; y A6 para
   resolver alias fuera del hilo GTK y del colector de hardware.
-- La preparación final actualiza únicamente README y CHANGELOG. La versión 3.2.0
-  está aprobada; la instalación real, integración en `main`, etiqueta y release
-  requieren autorizaciones posteriores.
+- El cierre documental actualiza únicamente README y CHANGELOG con los resultados
+  de integración e instalación ya verificados; no modifica código ni ejecuta
+  operaciones de publicación.
 
 ### Instalador por usuario (A4)
 
@@ -45,9 +45,9 @@ Los antecedentes 3.0.0 y 3.1.0 se conservan; este cierre no los renumera.
 - Instrucciones explícitas de instalación, comprobación y desinstalación de ambos
   canales como usuario normal; los comandos administrativos solo gestionan
   dependencias del sistema o el módulo opcional `drivetemp`.
-- Versión 3.2.0 aprobada y etiqueta futura propuesta `v3.2.0`, con comprobaciones,
-  integración en un clon independiente, despliegue y reversión sin modificar el
-  worktree estable protegido. La validación sigue siendo manual, sin workflow CI.
+- Versión 3.2.0 aprobada y etiqueta futura propuesta `v3.2.0`. Documentadas la
+  actualización estable y la reversión por canal; restaurar un launcher no revierte
+  el código del checkout al que apunta. La validación sigue siendo manual, sin CI.
 
 ### Validación de preparación (2026-10-15)
 
@@ -55,8 +55,23 @@ Los antecedentes 3.0.0 y 3.1.0 se conservan; este cierre no los renumera.
   Xvfb y D-Bus con HOME/XDG temporales. Fedora Linux 44, Python 3.14.8, GTK 4.22.5;
   base de código `c77de5e` y cambios únicamente documentales.
 - `git diff --check`, `bash -n install.sh` y validación de las dos plantillas
-  `.desktop` con rutas con espacios: correctos. La instalación real queda pendiente
-  de autorización; no se modifican `main` ni el worktree estable.
+  `.desktop` con rutas con espacios: correctos en esa validación de preparación.
+- Se conserva este resultado histórico anterior a la integración; no se registra
+  una nueva suite completa posterior ni se acreditan pruebas de carga GPU.
+
+### Cierre documental e instalación local (2026-10-16)
+
+- `main` recibió mediante fast-forward el commit
+  `2ffad3d1ad0b826e1a8dda146eae00b13aa8f8bc`.
+- Instalación local estable actualizada de `4df03aa` a `2ffad3d`, con las acciones
+  `validate`, `install` y `check` del instalador estable verificadas correctamente.
+- Launcher estable con `--channel stable` explícito; el icono global histórico
+  conserva su SHA-256.
+- DEV y estable se ejecutaron simultáneamente con identidades D-Bus diferentes;
+  ambas aplicaciones mostraron telemetría GPU coherente con `nvidia-smi`.
+- Registros comprobados en directorios XDG independientes para ambos canales.
+- Captura oficial `screenshot.png` actualizada en `f4f5f99`, sin otros cambios en
+  ese commit. Este cierre documental no crea la etiqueta ni la GitHub Release.
 
 ## 3.1.0
 
