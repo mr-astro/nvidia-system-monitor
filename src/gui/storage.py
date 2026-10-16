@@ -10,6 +10,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Pango
 
 from src.gui.widgets import MetricCard, _set_text, LEVEL_CLASSES
+from src.data.storage import NON_FILESYSTEM_TYPES
 from src.utils.formatting import fmt_bytes, fmt_temp, usage_level
 
 STORAGE_CSS = """
@@ -191,12 +192,11 @@ class DiskCard(Gtk.Box):
         self.empty.set_label("Sin particiones")
         self.partitions_box.append(self.empty)
 
-    def _update_usage(self, partitions, snap, now, medium, high):
+    def _update_usage(self, partitions, snap, now, medium, high, direct=None):
         # Container devices have no filesystem usage of their own. Unknown
         # leaves count conservatively; unmounted filesystems still count.
-        filesystems = [part for part in partitions if part.fstype not in {
-            "crypto_LUKS", "LVM2_member", "linux_raid_member", "swap"
-        }]
+        filesystems = ([direct] if direct is not None else
+                       [part for part in partitions if part.fstype not in NON_FILESYSTEM_TYPES])
         self.usage_bar.set_visible(False)
         self.usage_scope.set_visible(False)
         self.usage_warning.set_visible(False)
@@ -208,6 +208,14 @@ class DiskCard(Gtk.Box):
             set_label(self.usage, "Uso no disponible")
             return
         part = filesystems[0]
+        name = partition_title(part)
+        technical = f" ({part.name})" if name != part.name else ""
+        if direct is not None:
+            mount = ", ".join(part.mountpoints) or "Sin montar"
+            shared = " · espacio compartido" if part.fstype == "btrfs" and len(part.mountpoints) > 1 else ""
+            self.usage_scope.set_visible(True)
+            set_label(self.usage_scope, f"Uso de {name}{technical} · sistema de archivos en disco completo"
+                      f" · {part.fstype} · {mount}{shared}")
         state = snap.sources.get("usage:" + part.name)
         values = (part.used_bytes, part.free_bytes, part.usage_percent)
         valid = (bool(part.mountpoints) and state is not None and state.acquired_at is not None
@@ -217,10 +225,9 @@ class DiskCard(Gtk.Box):
         if not valid:
             set_label(self.usage, "Uso no disponible", state_detail(state, now))
             return
-        name = partition_title(part)
-        technical = f" ({part.name})" if name != part.name else ""
-        self.usage_scope.set_visible(True)
-        set_label(self.usage_scope, f"Uso de {name}{technical}")
+        if direct is None:
+            self.usage_scope.set_visible(True)
+            set_label(self.usage_scope, f"Uso de {name}{technical}")
         set_label(self.usage, usage_text(part),
                   f"Utilización del sistema de archivos {part.name}\n"
                   f"Montajes: {', '.join(part.mountpoints)}\n{usage_text(part)}\n{state_detail(state, now)}")
@@ -254,9 +261,12 @@ class DiskCard(Gtk.Box):
             text += " · " + age_text(temperature, now)
         self.temperature.set_label(text)
         self.temperature.set_tooltip_text(f"Fuente: {temperature_key or 'N/D'}\nÚltima temperatura: {fmt_temp(value, unit)}\n{state_detail(temperature, now)}")
+        usage_keys = {"usage:" + part.name for part in disk.partitions}
+        if disk.direct_filesystem is not None:
+            usage_keys.add("usage:" + disk.direct_filesystem.name)
         relevant = {key: state for key, state in snap.sources.items()
                     if key == "topology" or key in {"storage", "smart:" + disk.name, "temperature:" + disk.name, "udisks:" + disk.name}
-                    or key in {"usage:" + part.name for part in disk.partitions}}
+                    or key in usage_keys}
         messages = []
         details = []
         def current_measurement(key):
@@ -285,7 +295,7 @@ class DiskCard(Gtk.Box):
         set_label(self.status, " · ".join(dict.fromkeys(messages)), "\n".join(details))
         self.technical.set_tooltip_text(f"Capacidad/topología: {state_detail(topology, now)}\n{self.technical.get_label()}")
         partitions = display_partitions(disk.partitions)
-        self._update_usage(partitions, snap, now, medium, high)
+        self._update_usage(partitions, snap, now, medium, high, disk.direct_filesystem)
         self.empty.set_visible(not partitions)
         active = set()
         previous = self.empty

@@ -55,6 +55,42 @@ class Sensors:
 
 
 class CollectOnce(unittest.TestCase):
+    def test_direct_usage_publication_error_recovery_and_cleanup(self):
+        from tests.test_storage import fake_monitor
+
+        now = [0.0]
+        monitor = fake_monitor(clock=lambda: now[0])
+        devices = [{'name': 'sdb', 'type': 'disk', 'fstype': 'ext4', 'mountpoints': ['/mnt/datos']}]
+        mounts = {'/mnt/datos': ('10', '8:16', '/', 'ext4', '/dev/sdb')}
+        stat = SimpleNamespace(f_blocks=1000, f_bfree=400, f_bavail=300, f_frsize=4096)
+        collector = Collector(storage=monitor, clock=lambda: now[0])
+        with mock.patch.object(monitor, '_run_lsblk', side_effect=lambda: list(devices)), \
+                mock.patch.object(monitor, '_read_mountinfo', return_value=mounts), \
+                mock.patch.object(monitor, '_temperature', return_value=None), \
+                mock.patch('src.data.storage.os.statvfs', return_value=stat) as statvfs:
+            first = collector.collect_once()
+            self.assertEqual(first.disks[0].direct_filesystem.used_bytes, 600 * 4096)
+            self.assertEqual(first.sources['usage:sdb'].acquired_at, 0)
+            now[0] = 1
+            statvfs.side_effect = OSError('synthetic temporary failure')
+            failed = collector.collect_once()
+            self.assertIn('usage:sdb', failed.errors)
+            self.assertEqual(failed.sources['usage:sdb'].acquired_at, 0)
+            self.assertEqual(failed.disks[0].direct_filesystem.used_bytes, 600 * 4096)
+            now[0] = 2
+            statvfs.side_effect = None
+            recovered = collector.collect_once()
+            self.assertNotIn('usage:sdb', recovered.errors)
+            self.assertEqual(recovered.sources['usage:sdb'].acquired_at, 2)
+            self.assertNotIn('usage:sdb', first.errors)
+            self.assertEqual(first.sources['usage:sdb'].acquired_at, 0)
+            devices.clear()
+            now[0] = 16
+            gone = collector.collect_once()
+            self.assertEqual(gone.disks, [])
+            self.assertNotIn('usage:sdb', gone.sources)
+            self.assertNotIn('usage:sdb', gone.errors)
+
     def test_full_snapshot(self):
         snap = Collector(cpu=Cpu(), gpu=Gpu(), ram=Ram()).collect_once()
         self.assertEqual(snap.cpu.model, "X")

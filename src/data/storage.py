@@ -21,6 +21,7 @@ from src.data.udisks import UDisksTemperature
 from src.data.identity import DeviceIdentity, Presence, probe, sequence
 
 ND = "N/D"
+NON_FILESYSTEM_TYPES = frozenset({"crypto_LUKS", "LVM2_member", "linux_raid_member", "swap"})
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _ATA_TEMP_ATTRIBUTES = {"Temperature_Celsius", "Airflow_Temperature_Cel", "Temperature_Internal"}
 _SIMPLE_TEMP = re.compile(r"(?:Temperature|Current Drive Temperature):\s*(\d+)\b")
@@ -53,6 +54,7 @@ class DiskMetrics:
     temperature_c: Optional[float] = None
     partitions: list = field(default_factory=list)
     temperature_source: Optional[str] = None
+    direct_filesystem: Optional[PartitionMetrics] = None
 
 
 def _truthy(value) -> bool:
@@ -229,7 +231,7 @@ class StorageMonitor:
         mounts = node.get("mountpoints")
         if mounts is None and node.get("mountpoint"):
             mounts = [node["mountpoint"]]
-        return [m for m in (mounts or []) if m]
+        return list(dict.fromkeys(m for m in (mounts or []) if m))
 
     @staticmethod
     def _unescape(value):
@@ -262,7 +264,7 @@ class StorageMonitor:
                         self._mount_identities[(name, path)] = identity
             self._bind_mounts(node.get("children") or [], mounts)
 
-    def _partition(self, node: dict, depth: int) -> PartitionMetrics:
+    def _partition(self, node: dict, depth: int, *, direct=False) -> PartitionMetrics:
         name = str(node.get("name") or ND)
         mounts = self._mountpoints(node)
         key = "usage:" + name
@@ -270,6 +272,17 @@ class StorageMonitor:
         previous = self.sources.get(key, SourceState())
         valid = [path for path in mounts if (name, path) in self._mount_identities
                  and self._valid_mounts.get(path) == self._mount_identities[(name, path)]]
+        if direct and valid:
+            identities = [self._mount_identities[(name, path)] for path in valid]
+            # Mount roots/IDs may differ for bind mounts and Btrfs subvolumes,
+            # but a whole-device filesystem must have one unambiguous backing.
+            backings = {(identity[3], os.path.realpath(identity[-1]) if identity[3] == "btrfs"
+                         else identity[1]) for identity in identities}
+            if (len(backings) != 1
+                    or any(node.get("fstype") and node["fstype"] != identity[3] for identity in identities)
+                    or any(node.get("maj:min") and identity[3] != "btrfs"
+                           and node["maj:min"] != identity[1] for identity in identities)):
+                valid = []
         values = (None, None, None)
         error = None
         if any(path.startswith("/") for path in mounts):
@@ -635,6 +648,11 @@ class StorageMonitor:
             # zram is virtual swap; loop/rom devices are not physical storage.
             if str(d.get("type") or "") != "disk" or name.startswith("zram"):
                 continue
+            fstype = d.get("fstype")
+            has_filesystem = fstype not in NON_FILESYSTEM_TYPES and (
+                bool(fstype and fstype != ND)
+                or any(path.startswith("/") for path in self._mountpoints(d))
+            )
             disks.append(DiskMetrics(
                 name=name or ND,
                 model=str(d.get("model") or ND).strip() or ND,
@@ -644,6 +662,7 @@ class StorageMonitor:
                 temperature_c=self._temperature(name),
                 partitions=list(self._flatten(d.get("children"))),
                 temperature_source=self._temperature_sources.get(name),
+                direct_filesystem=self._partition(d, 0, direct=True) if has_filesystem else None,
             ))
         return disks
 
@@ -685,6 +704,8 @@ class StorageMonitor:
         for disk in disks:
             active.update(("temperature:" + disk.name, "smart:" + disk.name, "udisks:" + disk.name))
             active.update("usage:" + p.name for p in disk.partitions)
+            if disk.direct_filesystem is not None:
+                active.add("usage:" + disk.direct_filesystem.name)
         self.sources = {k: v for k, v in self.sources.items() if k in active}
         self.errors = {k: v for k, v in self.errors.items() if k in active or k == "storage"}
         names = {disk.name for disk in disks}

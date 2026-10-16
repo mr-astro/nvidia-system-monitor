@@ -253,6 +253,129 @@ class StorageGui(unittest.TestCase):
         snap.sources.update({'usage:' + part.name: SourceState(0, 0, 2) for part in parts})
         return snap
 
+    def direct_snapshot(self, fstype='ext4', mounts=None):
+        fs = PartitionMetrics('sdb', fstype=fstype, label='Datos', depth=0,
+                              mountpoints=['/mnt/datos'] if mounts is None else mounts,
+                              used_bytes=60, free_bytes=20, usage_percent=75)
+        snap = self.snapshot(DiskMetrics('sdb', size_bytes=10**12, direct_filesystem=fs))
+        snap.sources['usage:sdb'] = SourceState(0, 0, 2)
+        return snap
+
+    def test_direct_filesystem_has_only_header_usage_and_physical_capacity(self):
+        for fstype in ('ext4', 'xfs'):
+            with self.subTest(fstype=fstype):
+                snap = self.direct_snapshot(fstype)
+                self.panel.update(snap, 1)
+                card = self.card('sdb')
+                self.assertEqual(card.partition_rows, {})
+                self.assertEqual(snap.disks[0].partitions, [])
+                self.assertTrue(card.usage_bar.get_visible())
+                self.assertEqual(card.usage_bar.get_fraction(), .75)
+                self.assertIn('931,3 GiB', card.technical.get_label())
+                self.assertIn('60,0 B usados', card.usage.get_label())
+                self.assertIn('20,0 B disponibles', card.usage.get_label())
+                self.assertIn('Uso de Datos (sdb)', card.usage_scope.get_label())
+                self.assertIn('sistema de archivos en disco completo', card.usage_scope.get_label())
+                self.assertIn(fstype, card.usage_scope.get_label())
+                self.assertIn('/mnt/datos', card.usage_scope.get_label())
+                self.assertIn('usage:sdb', card.status.get_tooltip_text())
+
+    def test_direct_btrfs_routes_share_one_bar_and_do_not_sum_usage(self):
+        snap = self.direct_snapshot('btrfs', ['/', '/home'])
+        self.panel.update(snap, 1)
+        card = self.card('sdb')
+        self.assertEqual(len(self.panel.disk_cards), 1)
+        self.assertEqual(card.partition_rows, {})
+        self.assertTrue(card.usage_bar.get_visible())
+        self.assertEqual(card.usage_bar.get_fraction(), .75)
+        self.assertIn('60,0 B usados', card.usage.get_label())
+        self.assertIn('/, /home', card.usage_scope.get_label())
+        self.assertIn('espacio compartido', card.usage_scope.get_label())
+        self.assertIn('Montajes: /, /home', card.usage.get_tooltip_text())
+
+    def test_direct_mount_error_unmount_and_recovery_reuse_card_and_expansion(self):
+        snap = self.direct_snapshot()
+        self.panel.update(snap, 1)
+        card = self.card('sdb')
+        bar = card.usage_bar
+        card.expander.set_expanded(True)
+        snap.sources['usage:sdb'] = SourceState(0, 0, 2, 'No se pudo leer el uso del montaje')
+        snap.errors['usage:sdb'] = 'No se pudo leer el uso del montaje'
+        self.panel.update(snap, 3)
+        self.assertTrue(bar.get_visible())
+        self.assertIn('Uso obsoleto · hace 3 s', card.usage_warning.get_label())
+        self.assertIn('No se pudo leer', card.status.get_tooltip_text())
+        fs = snap.disks[0].direct_filesystem
+        fs.mountpoints = []
+        fs.used_bytes = fs.free_bytes = fs.usage_percent = None
+        snap.sources['usage:sdb'] = SourceState(0, 0, 2, 'Montaje desaparecido')
+        self.panel.update(snap, 4)
+        self.assertFalse(bar.get_visible())
+        self.assertEqual(card.usage.get_label(), 'Uso no disponible')
+        self.assertIn('Sin montar', card.usage_scope.get_label())
+        fs.mountpoints = ['/mnt/datos']
+        fs.used_bytes, fs.free_bytes, fs.usage_percent = 40, 60, 40
+        snap.sources['usage:sdb'] = SourceState(5, 5, 2)
+        snap.errors.clear()
+        self.panel.update(snap, 5)
+        self.assertIs(self.card('sdb'), card)
+        self.assertIs(card.usage_bar, bar)
+        self.assertTrue(card.expander.get_expanded())
+        self.assertTrue(bar.get_visible())
+        self.assertEqual(bar.get_fraction(), .4)
+        self.assertFalse(card.usage_warning.get_visible())
+        self.assertEqual(card.partition_rows, {})
+
+    def test_direct_unmounted_or_unmeasured_filesystem_has_no_bar(self):
+        snap = self.direct_snapshot(mounts=[])
+        self.panel.update(snap, 1)
+        card = self.card('sdb')
+        self.assertFalse(card.usage_bar.get_visible())
+        self.assertIn('Sin montar', card.usage_scope.get_label())
+        snap.disks[0].direct_filesystem.mountpoints = ['/mnt/datos']
+        snap.sources['usage:sdb'] = SourceState(error='No se pudo leer el uso del montaje')
+        self.panel.update(snap, 1)
+        self.assertFalse(card.usage_bar.get_visible())
+        self.assertEqual(card.usage.get_label(), 'Uso no disponible')
+
+    def test_switching_direct_and_partitioned_layout_keeps_card_and_expansion(self):
+        snap = self.direct_snapshot()
+        self.panel.update(snap, 0)
+        card = self.card('sdb')
+        card.expander.set_expanded(True)
+        disk = snap.disks[0]
+        disk.direct_filesystem = None
+        disk.partitions = [PartitionMetrics('sdb1', fstype='ext4', mountpoints=['/part'],
+                                           used_bytes=50, free_bytes=50, usage_percent=50)]
+        snap.sources = {'topology': SourceState(1, 1, 20), 'usage:sdb1': SourceState(1, 1, 2)}
+        self.panel.update(snap, 1)
+        self.assertIs(self.card('sdb'), card)
+        self.assertTrue(card.expander.get_expanded())
+        self.assertEqual(len(card.partition_rows), 1)
+        self.assertIn('Uso de sdb1', card.usage_scope.get_label())
+        snap = self.direct_snapshot()
+        self.panel.update(snap, 1)
+        self.assertIs(self.card('sdb'), card)
+        self.assertTrue(card.expander.get_expanded())
+        self.assertEqual(card.partition_rows, {})
+
+    def test_direct_mount_changes_keep_temperature_source_and_age_visible(self):
+        snap = self.direct_snapshot()
+        disk = snap.disks[0]
+        disk.temperature_c = 38
+        disk.temperature_source = 'smart:sdb'
+        snap.sources['smart:sdb'] = SourceState(0, 0, 15)
+        self.panel.update(snap, 1)
+        card = self.card('sdb')
+        disk.direct_filesystem.mountpoints = []
+        disk.direct_filesystem.used_bytes = None
+        snap.sources['usage:sdb'] = SourceState(0, 0, 2, 'Montaje desaparecido')
+        self.panel.update(snap, 3)
+        self.assertIn('38,0 °C', card.temperature.get_label())
+        self.assertIn('hace 3 s', card.temperature.get_label())
+        self.assertIn('smart:sdb', card.temperature.get_tooltip_text())
+        self.assertNotIn('Temperatura no disponible', card.status.get_label())
+
     def test_header_bar_names_filesystem_and_uses_its_percentage_not_disk_size(self):
         part = PartitionMetrics('sda1', fstype='ext4', label='Datos', mountpoints=['/data'],
                                 used_bytes=60, free_bytes=20, usage_percent=75)

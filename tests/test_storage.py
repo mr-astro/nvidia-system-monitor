@@ -1,3 +1,4 @@
+import copy
 import os
 import tempfile
 import types
@@ -370,6 +371,257 @@ class StorageReliability(unittest.TestCase):
             mounts = StorageMonitor._read_mountinfo(self.monitor)
         self.assertIn("/mnt data", mounts)
         self.assertEqual(mounts["/mnt data"][-1], "/dev/mapper/vg-lv")
+
+
+class DirectFilesystems(unittest.TestCase):
+    """A3: whole-device usage through the public path, with synthetic mounts."""
+
+    def setUp(self):
+        self.now = [0.0]
+        self.monitor = fake_monitor(clock=lambda: self.now[0])
+        self.device = {
+            'name': 'sdb', 'type': 'disk', 'size': 10**12, 'model': 'Synthetic disk',
+            'tran': 'sata', 'fstype': 'ext4', 'mountpoints': ['/mnt/datos'],
+            'maj:min': '8:16', 'label': ' Datos ',
+        }
+        self.devices = [self.device]
+        self.mounts = {'/mnt/datos': ('10', '8:16', '/', 'ext4', '/dev/sdb')}
+        self.stat = types.SimpleNamespace(f_blocks=1000, f_bfree=400, f_bavail=300, f_frsize=4096)
+        for patcher in (
+            mock.patch.object(self.monitor, '_read_mountinfo', side_effect=lambda: dict(self.mounts)),
+            mock.patch.object(self.monitor, '_run_lsblk', side_effect=lambda: copy.deepcopy(self.devices)),
+            mock.patch.object(self.monitor, '_temperature', return_value=38),
+            mock.patch('src.data.storage.os.statvfs', return_value=self.stat),
+        ):
+            patched = patcher.start()
+            if patcher.attribute == 'statvfs':
+                self.statvfs = patched
+            self.addCleanup(patcher.stop)
+
+    def disk(self):
+        return self.monitor.get_metrics()[0]
+
+    def test_ext4_has_direct_usage_and_no_fictitious_partition(self):
+        disk = self.disk()
+        fs = disk.direct_filesystem
+        self.assertEqual(disk.partitions, [])
+        self.assertEqual((fs.name, fs.fstype, fs.label, fs.depth), ('sdb', 'ext4', 'Datos', 0))
+        self.assertEqual(fs.mountpoints, ['/mnt/datos'])
+        self.assertEqual((fs.used_bytes, fs.free_bytes), (600 * 4096, 300 * 4096))
+        self.assertAlmostEqual(fs.usage_percent, 600 / 900 * 100)
+        self.statvfs.assert_called_once_with('/mnt/datos')
+
+    def test_physical_capacity_is_independent_of_filesystem_capacity(self):
+        disk = self.disk()
+        self.assertEqual(disk.size_bytes, 10**12)
+        self.assertNotEqual(disk.size_bytes, self.stat.f_blocks * self.stat.f_frsize)
+        self.assertAlmostEqual(disk.direct_filesystem.usage_percent, 600 / 900 * 100)
+        self.assertNotAlmostEqual(disk.direct_filesystem.usage_percent,
+                                  disk.direct_filesystem.used_bytes / disk.size_bytes * 100)
+
+    def test_xfs_uses_the_same_validated_reader(self):
+        self.device['fstype'] = 'xfs'
+        self.mounts['/mnt/datos'] = ('10', '8:16', '/', 'xfs', '/dev/sdb')
+        fs = self.disk().direct_filesystem
+        self.assertEqual(fs.fstype, 'xfs')
+        self.assertEqual(fs.used_bytes, 600 * 4096)
+
+    def test_btrfs_subvolumes_and_repeated_paths_share_one_reading(self):
+        self.device.update(fstype='btrfs', mountpoints=['/', '/home', '/', None])
+        self.mounts = {'/': ('20', '0:42', '/@', 'btrfs', '/dev/sdb'),
+                       '/home': ('21', '0:42', '/@home', 'btrfs', '/dev/sdb')}
+        disk = self.disk()
+        fs = disk.direct_filesystem
+        self.assertEqual(fs.mountpoints, ['/', '/home'])
+        self.assertEqual(fs.used_bytes, 600 * 4096)
+        self.assertEqual(disk.partitions, [])
+        self.statvfs.assert_called_once_with('/')
+        self.mounts.pop('/')
+        self.now[0] = 1
+        self.statvfs.reset_mock()
+        self.assertEqual(self.disk().direct_filesystem.mountpoints, ['/home'])
+        self.statvfs.assert_called_once_with('/home')
+
+    def test_bind_mounts_do_not_add_usage_and_unreadable_first_path_falls_back(self):
+        self.device['mountpoints'] = ['/mnt/datos', '/mnt/alias', '/mnt/alias']
+        self.mounts['/mnt/alias'] = ('11', '8:16', '/folder', 'ext4', '/dev/sdb')
+        self.statvfs.side_effect = [OSError('synthetic failure'), self.stat]
+        fs = self.disk().direct_filesystem
+        self.assertEqual(fs.mountpoints, ['/mnt/datos', '/mnt/alias'])
+        self.assertEqual(fs.used_bytes, 600 * 4096)
+        self.assertEqual(self.statvfs.call_args_list,
+                         [mock.call('/mnt/datos'), mock.call('/mnt/alias')])
+
+    def test_legacy_mountpoint_is_supported(self):
+        self.device.pop('mountpoints')
+        self.device['mountpoint'] = '/mnt/datos'
+        self.assertEqual(self.disk().direct_filesystem.used_bytes, 600 * 4096)
+
+    def test_unmounted_filesystem_and_blank_disk_have_no_invented_usage(self):
+        self.device['mountpoints'] = [None]
+        self.mounts.clear()
+        fs = self.disk().direct_filesystem
+        self.assertEqual(fs.fstype, 'ext4')
+        self.assertEqual(fs.mountpoints, [])
+        self.assertEqual((fs.used_bytes, fs.free_bytes, fs.usage_percent), (None, None, None))
+        self.statvfs.assert_not_called()
+        self.device['fstype'] = None
+        self.now[0] = 16
+        self.assertIsNone(self.disk().direct_filesystem)
+        self.assertNotIn('usage:sdb', self.monitor.sources)
+
+    def test_valid_mount_with_missing_fstype_can_supply_usage(self):
+        self.device['fstype'] = None
+        self.assertEqual(self.disk().direct_filesystem.used_bytes, 600 * 4096)
+
+    def test_unmount_invalidates_usage_before_topology_refresh(self):
+        self.disk()
+        self.mounts.clear()
+        self.now[0] = 1
+        self.statvfs.reset_mock()
+        fs = self.disk().direct_filesystem
+        self.assertEqual(fs.mountpoints, [])
+        self.assertIsNone(fs.used_bytes)
+        self.assertNotIn('sdb', self.monitor._usage_cache)
+        self.assertIn('usage:sdb', self.monitor.errors)
+        self.assertEqual(self.monitor.sources['usage:sdb'].acquired_at, 0)
+        self.monitor._run_lsblk.assert_called_once()
+        self.statvfs.assert_not_called()
+
+    def test_replaced_mount_and_remount_require_fresh_binding(self):
+        self.disk()
+        for replacement in (('99', '8:32', '/', 'ext4', '/dev/sdc'),
+                            ('100', '8:16', '/', 'ext4', '/dev/sdb')):
+            with self.subTest(replacement=replacement):
+                self.mounts['/mnt/datos'] = replacement
+                self.now[0] += 1
+                self.assertIsNone(self.disk().direct_filesystem.used_bytes)
+                self.assertNotIn('sdb', self.monitor._usage_cache)
+        self.now[0] = 16
+        self.assertEqual(self.disk().direct_filesystem.used_bytes, 600 * 4096)
+        self.assertEqual(self.monitor.sources['usage:sdb'].acquired_at, 16)
+        self.assertNotIn('usage:sdb', self.monitor.errors)
+
+    def test_statvfs_error_keeps_only_validated_values_and_original_times(self):
+        first = self.disk().direct_filesystem
+        original = self.monitor.sources['usage:sdb']
+        self.now[0] = 3
+        self.statvfs.side_effect = OSError('synthetic temporary failure')
+        failed = self.disk().direct_filesystem
+        state = self.monitor.sources['usage:sdb']
+        self.assertEqual(failed.used_bytes, first.used_bytes)
+        self.assertEqual((state.acquired_at, state.completed_at),
+                         (original.acquired_at, original.completed_at))
+        self.assertTrue(state.stale(3))
+        self.assertIn('usage:sdb', self.monitor.errors)
+        self.now[0] = 4
+        self.statvfs.side_effect = None
+        self.statvfs.return_value = types.SimpleNamespace(f_blocks=1000, f_bfree=800, f_bavail=700, f_frsize=4096)
+        recovered = self.disk().direct_filesystem
+        self.assertEqual(recovered.used_bytes, 200 * 4096)
+        self.assertEqual(self.monitor.sources['usage:sdb'].acquired_at, 4)
+        self.assertNotIn('usage:sdb', self.monitor.errors)
+        self.assertEqual(first.used_bytes, 600 * 4096)
+
+    def test_first_error_does_not_invent_zero_and_unmount_cannot_reuse_cache(self):
+        self.statvfs.side_effect = OSError('synthetic failure')
+        self.assertIsNone(self.disk().direct_filesystem.used_bytes)
+        self.assertIsNone(self.monitor.sources['usage:sdb'].acquired_at)
+        self.now[0] = 1
+        self.statvfs.side_effect = None
+        self.disk()
+        self.mounts.clear()
+        self.now[0] = 2
+        self.statvfs.side_effect = OSError('synthetic failure')
+        self.assertIsNone(self.disk().direct_filesystem.used_bytes)
+        self.assertNotIn('sdb', self.monitor._usage_cache)
+
+    def test_mount_change_during_acquisition_discards_result(self):
+        self.disk()
+        self.now[0] = 1
+        def replace_mount(path):
+            self.mounts[path] = ('99', '8:32', '/', 'ext4', '/dev/sdc')
+            return self.stat
+        self.statvfs.side_effect = replace_mount
+        fs = self.disk().direct_filesystem
+        self.assertIsNone(fs.used_bytes)
+        self.assertEqual(fs.mountpoints, [])
+        self.assertNotIn('sdb', self.monitor._usage_cache)
+        self.assertIn('durante', self.monitor.errors['usage:sdb'])
+
+    def test_mountinfo_failure_invalidates_cached_usage(self):
+        self.disk()
+        self.now[0] = 1
+        self.monitor._read_mountinfo.side_effect = OSError('synthetic mountinfo failure')
+        self.assertIsNone(self.disk().direct_filesystem.used_bytes)
+        self.assertIn('storage', self.monitor.errors)
+        self.assertIn('usage:sdb', self.monitor.errors)
+        self.assertNotIn('sdb', self.monitor._usage_cache)
+
+    def test_ambiguous_backing_or_contradictory_metadata_has_no_usage(self):
+        variants = [
+            {'/mnt/datos': ('10', '8:32', '/', 'ext4', '/dev/sdb')},
+            {'/mnt/datos': ('10', '8:16', '/', 'xfs', '/dev/sdb')},
+            {'/mnt/datos': ('10', '8:16', '/', 'ext4', '/dev/sdb'),
+             '/mnt/alias': ('11', '8:32', '/', 'ext4', '/dev/sdb')},
+        ]
+        self.device['mountpoints'] = ['/mnt/datos', '/mnt/alias']
+        for mounts in variants:
+            with self.subTest(mounts=mounts):
+                self.mounts = mounts
+                self.now[0] += 16
+                fs = self.disk().direct_filesystem
+                self.assertIsNone(fs.used_bytes)
+                self.assertEqual(fs.mountpoints, [])
+                self.assertIn('usage:sdb', self.monitor.errors)
+        self.statvfs.assert_not_called()
+
+    def test_container_types_are_not_direct_filesystems(self):
+        for fstype in ('crypto_LUKS', 'LVM2_member', 'linux_raid_member', 'swap'):
+            with self.subTest(fstype=fstype):
+                self.device['fstype'] = fstype
+                self.now[0] += 16
+                self.assertIsNone(self.disk().direct_filesystem)
+                self.assertNotIn('usage:sdb', self.monitor.sources)
+        self.statvfs.assert_not_called()
+
+    def test_partitioned_disk_preserves_real_descendants(self):
+        self.device.update(fstype=None, mountpoints=[], children=[{
+            'name': 'sdb1', 'type': 'part', 'size': 10**11, 'fstype': 'ext4',
+            'maj:min': '8:17', 'mountpoints': ['/mnt/datos'],
+        }])
+        self.mounts['/mnt/datos'] = ('10', '8:17', '/', 'ext4', '/dev/sdb1')
+        disk = self.disk()
+        self.assertIsNone(disk.direct_filesystem)
+        self.assertEqual([p.name for p in disk.partitions], ['sdb1'])
+        self.assertEqual(disk.partitions[0].used_bytes, 600 * 4096)
+        self.assertNotIn('usage:sdb', self.monitor.sources)
+
+    def test_whole_disk_luks_lvm_preserves_depth_and_mounts(self):
+        self.device.update(fstype='crypto_LUKS', mountpoints=[], children=[{
+            'name': 'crypt-data', 'type': 'crypt', 'fstype': 'LVM2_member',
+            'children': [{'name': 'vg-data', 'type': 'lvm', 'fstype': 'ext4',
+                          'mountpoints': ['/mnt/datos'], 'maj:min': '253:1'}],
+        }])
+        self.mounts['/mnt/datos'] = ('10', '253:1', '/', 'ext4', '/dev/mapper/vg-data')
+        disk = self.disk()
+        self.assertIsNone(disk.direct_filesystem)
+        self.assertEqual([(p.name, p.depth) for p in disk.partitions], [('crypt-data', 1), ('vg-data', 2)])
+        self.assertEqual(disk.partitions[1].used_bytes, 600 * 4096)
+
+    def test_direct_usage_source_error_and_cache_disappear_with_disk(self):
+        self.disk()
+        self.assertIn('usage:sdb', self.monitor.sources)
+        self.now[0] = 1
+        self.statvfs.side_effect = OSError('synthetic failure')
+        self.disk()
+        self.assertIn('usage:sdb', self.monitor.errors)
+        self.devices = []
+        self.now[0] = 16
+        self.assertEqual(self.monitor.get_metrics(), [])
+        self.assertNotIn('usage:sdb', self.monitor.sources)
+        self.assertNotIn('usage:sdb', self.monitor.errors)
+        self.assertNotIn('sdb', self.monitor._usage_cache)
 
 
 class TemperatureSelection(unittest.TestCase):

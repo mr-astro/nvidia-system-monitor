@@ -94,6 +94,42 @@ class ThermalIdentity(unittest.TestCase):
         self.assertEqual(first.disks[0].temperature_c, 38)
         self.assertEqual(first.sources['smart:sda'].acquired_at, 100)
 
+    def test_direct_filesystem_mount_changes_preserve_a2_temperature_and_identity(self):
+        self.nodes[0].update(fstype='ext4', mountpoints=['/mnt/datos'], label='Datos', size=10**12)
+        mounts = {'/mnt/datos': ('10', '8:0', '/', 'ext4', '/dev/sda')}
+        self.monitor._read_mountinfo.side_effect = lambda: dict(mounts)
+        stat = SimpleNamespace(f_blocks=1000, f_bfree=400, f_bavail=300, f_frsize=4096)
+        with mock.patch('src.data.storage.os.statvfs', return_value=stat) as statvfs:
+            first = self.metrics()['sda']
+            state = self.monitor.sources['smart:sda']
+            binding = self.monitor._bindings['sda']
+            generations = dict(self.monitor.thermal_generations)
+            self.assertEqual(first.direct_filesystem.used_bytes, 600 * 4096)
+            for moment, mounted, failing in ((101, True, True), (102, False, False), (103, True, False)):
+                self.now[0] = moment
+                statvfs.side_effect = OSError('synthetic failure') if failing else None
+                if mounted:
+                    mounts['/mnt/datos'] = ('10' if moment == 101 else '11', '8:0', '/', 'ext4', '/dev/sda')
+                else:
+                    mounts.clear()
+                disk = self.metrics()['sda']
+                self.assertEqual(disk.temperature_c, 38)
+                self.assertEqual(disk.temperature_source, 'smart:sda')
+                self.assertIs(self.monitor.sources['smart:sda'], state)
+                self.assertEqual(state.age(moment), moment - 100)
+                self.assertEqual(self.monitor._bindings['sda'], binding)
+                self.assertEqual(self.monitor._bindings['sda'].identity, self.live['sda'])
+                self.assertEqual(self.monitor.thermal_generations, generations)
+                self.assertEqual(disk.model, self.live['sda'].model)
+                if mounted:
+                    self.assertEqual(disk.direct_filesystem.used_bytes, 600 * 4096)
+                else:
+                    self.assertIsNone(disk.direct_filesystem.used_bytes)
+            self.assertEqual(self.run.call_count, 1)
+            self.assertNotIn('usage:sda', self.monitor.errors)
+            self.assertEqual(self.monitor.sources['usage:sda'].acquired_at, 103)
+            self.assertEqual(first.direct_filesystem.used_bytes, 600 * 4096)
+
     def test_cached_topology_cannot_authorize_new_attachment(self):
         self.monitor.topology_interval = 15
         self.metrics()
