@@ -54,7 +54,7 @@ def full_snapshot(n_gpus=1):
 class GuiSmoke(unittest.TestCase):
     _application_ids = itertools.count()
 
-    def _app(self, **overrides):
+    def _app(self, *, channel="stable", **overrides):
         from src.gui.app import SystemMonitorApp
         from src.utils.config import Config
 
@@ -63,9 +63,9 @@ class GuiSmoke(unittest.TestCase):
         path = Path(tmp.name) / "config.json"
         import json
         path.write_text(json.dumps({"logging_enabled": False, **overrides}))
-        app = SystemMonitorApp(Config(path))
+        app = SystemMonitorApp(Config(path, channel=channel), channel=channel)
         from src.data.storage_presentation import StorageAliasWorker
-        app.disk_aliases = StorageAliasWorker(Path(tmp.name) / "aliases.json", Path(tmp.name) / "by-id")
+        app.disk_aliases = StorageAliasWorker(Path(tmp.name) / "aliases.json", Path(tmp.name) / "by-id", channel=channel)
         app.collector.storage_aliases = app.disk_aliases if 'storage' in app.enabled else None
         self.addCleanup(app.disk_aliases.stop)
         # Each fixture exports its own D-Bus object, including when the host
@@ -95,6 +95,87 @@ class GuiSmoke(unittest.TestCase):
         self.assertEqual(app.cards["cpu"]._rows["usage"][1].get_label(), "42.0%")
         self.assertEqual(app.cards["cpu"]._rows["temp"][1].get_label(), "55.0 °C")
         self.assertIn("19.5 GiB", app.cards["gpu"]._rows["gpu0:vram"][1].get_label())
+
+    def test_featured_metrics_keep_technical_values_accessible(self):
+        app = self._app()
+        app._render(full_snapshot(n_gpus=2))
+        for name, key in (('cpu', 'usage'), ('ram', 'used'), ('gpu', 'gpu0:usage'), ('gpu', 'gpu1:usage')):
+            value = app.cards[name]._rows[key][1]
+            self.assertTrue(value.has_css_class('metric-hero-value'))
+            self.assertIsNone(value.get_ancestor(Gtk.Expander))
+        self.assertEqual(app.cards['ram']._rows['used'][1].get_label(), '50.0%')
+        self.assertIn('7.8 GiB usados de 15.6 GiB', app.cards['ram']._rows['allocation'][1].get_label())
+        self.assertEqual(app.cards['gpu']._rows['gpu1:power'][1].get_label(), '300.0 W')
+        for name, keys in (('cpu', ('maxfreq', 'cores', 'load')),
+                           ('ram', ('free', 'cache')),
+                           ('gpu', ('gpu0:limit', 'gpu1:core', 'gpu1:mem', 'gpu1:fan', 'driver', 'cuda'))):
+            for key in keys:
+                value = app.cards[name]._rows[key][1]
+                details = app.cards[name]._sections['details']
+                details.set_expanded(True)
+                self.assertIs(value.get_ancestor(Gtk.Expander), details)
+                self.assertTrue(value.get_visible())
+
+    def test_featured_metrics_and_technical_expansion_survive_updates_and_navigation(self):
+        app = self._app()
+        snap = full_snapshot()
+        app._render(snap)
+        cpu = app.cards['cpu']
+        usage = cpu._rows['usage']
+        temperature = cpu._rows['temp']
+        details = cpu._sections['details']
+        details.set_expanded(True)
+        for cycle in range(10):
+            app.stack.set_visible_child_name('storage' if cycle % 2 else 'performance')
+            snap.sequence += 1
+            snap.cpu.usage_percent = float(cycle)
+            snap.cpu.frequency_mhz = 3000.0 + cycle
+            app._render(snap)
+            self.assertIs(cpu._rows['usage'], usage)
+            self.assertIs(cpu._rows['temp'], temperature)
+            self.assertIs(cpu._rows['cores'][1].get_ancestor(Gtk.Expander), details)
+            self.assertTrue(details.get_expanded())
+            self.assertEqual(usage[1].get_label(), f'{cycle:.1f}%')
+            self.assertEqual(cpu._rows['freq'][1].get_label(), f'{3000 + cycle} MHz')
+
+    def test_featured_sections_recover_after_partial_render_error(self):
+        app = self._app()
+        snap = full_snapshot(n_gpus=2)
+        app._render(snap)
+        gpu = app.cards['gpu']
+        original = app._render_gpu
+        def broken(card, snapshot):
+            original(card, snapshot)
+            raise ValueError('synthetic featured render failure')
+        snap.sequence += 1
+        with mock.patch.object(app, '_render_gpu', side_effect=broken):
+            app._render(snap)
+        self.assertEqual(set(gpu._rows), {'state'})
+        self.assertEqual(gpu._sections, {})
+        snap.sequence += 1
+        app._render(snap)
+        self.assertEqual(app._last_render_error, {})
+        self.assertEqual(len(gpu._sections), 3)
+        power = gpu._rows['gpu1:power']
+        details = gpu._sections['details']
+        details.set_expanded(True)
+        snap.sequence += 1
+        snap.gpus[1].power_draw_w = 123.0
+        app._render(snap)
+        self.assertIs(gpu._rows['gpu1:power'], power)
+        self.assertEqual(power[1].get_label(), '123.0 W')
+        self.assertTrue(details.get_expanded())
+        for section in gpu._sections.values():
+            self.assertIs(section.get_ancestor(Gtk.ApplicationWindow), app.window)
+
+    def test_compact_dev_header_keeps_channel_and_status_without_duplicate_title(self):
+        app = self._app(channel='dev')
+        self.assertEqual(app.window.get_default_size(), (880, 700))
+        self.assertEqual(app.window.get_title(), 'NVIDIA System Monitor DEV')
+        badge = app.window.get_child().get_first_child().get_first_child()
+        self.assertEqual(badge.get_label(), 'DEV')
+        self.assertEqual(badge.get_tooltip_text(), app.window.get_title())
+        self.assertEqual(app.status.get_label(), 'Recopilando datos…')
 
     def test_usage_bar_gets_level_class(self):
         app = self._app()
@@ -140,25 +221,172 @@ class GuiSmoke(unittest.TestCase):
             errors = []
             provider = Gtk.CssProvider()
             provider.connect("parsing-error", lambda p, section, err: errors.append(err.message))
-            provider.load_from_string(build_css(DEFAULT_CONFIG["color_scheme"], dark))
+            css = build_css(DEFAULT_CONFIG["color_scheme"], dark)
+            try:
+                provider.load_from_string(css)
+            except AttributeError:
+                provider.load_from_data(css.encode("utf-8"))
             self.assertEqual(errors, [], f"dark={dark}")
 
     def test_system_theme_does_not_force_dark_colors(self):
         from src.gui.app import build_css
         from src.utils.config import DEFAULT_CONFIG
         colors = DEFAULT_CONFIG["color_scheme"]
-        self.assertIn("#1e1e1e", build_css(colors, dark=True))
-        self.assertNotIn("#1e1e1e", build_css(colors, dark=False))
+        for color in ("#101410", "#1B231C", "#76B900", "#F2F5F2", "#A5B0A5"):
+            self.assertIn(color, build_css(colors, dark=True))
+            self.assertNotIn(color, build_css(colors, dark=False))
         self.assertFalse(self._app(theme="system").dark)
         self.assertTrue(self._app().dark)
 
-    def test_storage_shares_the_gpu_column_and_ram_shares_the_cpu_column(self):
+    def test_performance_columns_and_storage_have_separate_pages(self):
         app = self._app()
         cpu, ram, gpu, storage = (app.cards[n] for n in ("cpu", "ram", "gpu", "storage"))
         self.assertIs(cpu.get_parent(), ram.get_parent())       # left column
         self.assertIsNot(cpu.get_parent(), gpu.get_parent())    # right column
-        self.assertIs(gpu.get_parent(), storage.get_parent())
+        self.assertIsNot(gpu.get_parent(), storage.get_parent())
         self.assertIsInstance(cpu.get_parent().get_parent().get_parent(), Gtk.FlowBox)
+        for card in (cpu, ram, gpu):
+            self.assertIs(card.get_ancestor(Gtk.ScrolledWindow), app.pages['performance'])
+        self.assertIs(storage.get_ancestor(Gtk.ScrolledWindow), app.pages['storage'])
+
+    def test_both_titled_pages_share_one_switcher_and_independent_scrollers(self):
+        app = self._app()
+        self.assertIs(app.switcher.get_stack(), app.stack)
+        pages = app.stack.get_pages()
+        self.assertEqual(pages.get_n_items(), 2)
+        for position, (name, title) in enumerate((('performance', 'RENDIMIENTO'), ('storage', 'ALMACENAMIENTO'))):
+            page = pages.get_item(position)
+            self.assertEqual(page.get_name(), name)
+            self.assertEqual(page.get_title(), title)
+            self.assertIs(page.get_child(), app.pages[name])
+            self.assertIsInstance(page.get_child(), Gtk.ScrolledWindow)
+        self.assertIsNot(app.pages['performance'].get_vadjustment(), app.pages['storage'].get_vadjustment())
+        self.assertEqual(app.stack.get_visible_child_name(), 'performance')
+        self.assertEqual(app.stack.get_transition_type(), Gtk.StackTransitionType.NONE)
+        performance_button = app.switcher.get_first_child()
+        storage_button = performance_button.get_next_sibling()
+        storage_button.set_active(True)
+        self.assertEqual(app.stack.get_visible_child_name(), 'storage')
+        self.assertFalse(performance_button.get_active())
+        performance_button.set_active(True)
+        self.assertEqual(app.stack.get_visible_child_name(), 'performance')
+        self.assertFalse(storage_button.get_active())
+
+    def test_switching_pages_preserves_cards_rows_and_expanded_disk_without_duplicates(self):
+        app = self._app(panels={'sensors': True})
+        snap = full_snapshot(n_gpus=2)
+        app._render(snap)
+        cards = dict(app.cards)
+        parents = {name: card.get_parent() for name, card in cards.items()}
+        cpu_row = cards['cpu']._rows['usage']
+        gpu_row = cards['gpu']._rows['gpu1:vram']
+        disk = next(iter(cards['storage'].disk_cards.values()))
+        partition = next(iter(disk.partition_rows.values()))
+        disk.expander.set_expanded(True)
+        for cycle in range(20):
+            app.stack.set_visible_child_name('storage' if cycle % 2 else 'performance')
+            snap.sequence += 1
+            app._render(snap)
+            self.assertEqual(app.cards, cards)
+            for name, card in cards.items():
+                self.assertIs(card.get_parent(), parents[name])
+            self.assertIs(cards['cpu']._rows['usage'], cpu_row)
+            self.assertIs(cards['gpu']._rows['gpu1:vram'], gpu_row)
+            self.assertEqual(list(cards['storage'].disk_cards.values()), [disk])
+            self.assertIs(next(iter(disk.partition_rows.values())), partition)
+            self.assertTrue(disk.expander.get_expanded())
+        descendants = []
+        def visit(widget):
+            descendants.append(widget)
+            child = widget.get_first_child()
+            while child is not None:
+                visit(child)
+                child = child.get_next_sibling()
+        visit(app.stack)
+        for card in cards.values():
+            self.assertEqual(sum(widget is card for widget in descendants), 1)
+
+    def test_hidden_pages_receive_new_metrics_and_keep_them_when_shown(self):
+        app = self._app()
+        snap = full_snapshot(n_gpus=2)
+        app._render(snap)
+        app.stack.set_visible_child_name('storage')
+        snap.sequence += 1
+        snap.cpu.usage_percent = 73.0
+        snap.gpus[1].memory_used_mb = 1024
+        with mock.patch.object(app.collector, 'latest', return_value=snap):
+            app._on_tick()
+        self.assertEqual(app.cards['cpu']._rows['usage'][1].get_label(), '73.0%')
+        self.assertIn('1.0 GiB', app.cards['gpu']._rows['gpu1:vram'][1].get_label())
+        app.stack.set_visible_child_name('performance')
+        snap.sequence += 1
+        snap.disks[0].model = 'Updated disk'
+        with mock.patch.object(app.collector, 'latest', return_value=snap):
+            app._on_tick()
+        disk = next(iter(app.cards['storage'].disk_cards.values()))
+        self.assertEqual(disk.title.get_label(), 'Updated disk')
+        app.stack.set_visible_child_name('storage')
+        self.assertIs(next(iter(app.cards['storage'].disk_cards.values())), disk)
+        self.assertEqual(disk.title.get_label(), 'Updated disk')
+
+    def test_navigation_build_and_tick_do_not_poll_hardware(self):
+        from contextlib import ExitStack
+        methods = ('src.data.cpu.CpuMonitor.get_metrics', 'src.data.ram.RamMonitor.get_metrics',
+                   'src.data.nvidia.NvidiaMonitor.get_metrics', 'src.data.nvidia.NvidiaMonitor.get_cuda_version',
+                   'src.data.storage.StorageMonitor.get_metrics', 'src.data.sensors.SensorMonitor.get_readings')
+        with ExitStack() as patches:
+            queries = [patches.enter_context(mock.patch(method, side_effect=AssertionError('hardware polling on GTK')))
+                       for method in methods]
+            app = self._app(panels={'sensors': True})
+            with mock.patch.object(app.collector, 'latest', return_value=full_snapshot()):
+                for name in ('performance', 'storage', 'performance'):
+                    app.stack.set_visible_child_name(name)
+                    app._on_tick()
+            self.assertEqual(app._last_render_error, {})
+            for query in queries:
+                query.assert_not_called()
+
+    def test_disabled_panels_leave_both_pages_available_without_acquisition(self):
+        for enabled in ('cpu', 'gpu', 'ram', 'sensors', 'storage', None):
+            with self.subTest(enabled=enabled):
+                app = self._app(panels={name: name == enabled for name in ('cpu', 'gpu', 'ram', 'storage', 'sensors')})
+                for name in ('cpu', 'gpu', 'ram', 'storage', 'sensors'):
+                    self.assertEqual(getattr(app.collector, name) is not None, name == enabled)
+                for page in ('performance', 'storage'):
+                    app.stack.set_visible_child_name(page)
+                    app._render(full_snapshot())
+                self.assertEqual(set(app.cards), {enabled} if enabled else set())
+                for page, names in (('performance', {'cpu', 'gpu', 'ram', 'sensors'}), ('storage', {'storage'})):
+                    if enabled not in names:
+                        viewport = app.pages[page].get_child()
+                        content = viewport.get_child() if isinstance(viewport, Gtk.Viewport) else viewport
+                        self.assertIsInstance(content.get_first_child(), Gtk.Label)
+
+    def test_hidden_storage_reconnection_preserves_physical_expansion_without_inheriting_replacement(self):
+        app = self._app()
+        snap = full_snapshot()
+        name = snap.disks[0].name
+        disk = snap.disks[0]
+        def present(key, physical):
+            snap.sequence += 1
+            snap.disks = [disk]
+            snap.storage_presentation = StoragePresentation(identities=(
+                (name, DiskIdentity(key, expansion_key=physical)),))
+            app._render(snap)
+            return next(iter(app.cards['storage'].disk_cards.values()))
+        first = present('presence:1', 'physical-A')
+        first.expander.set_expanded(True)
+        snap.sequence += 1
+        snap.disks = []
+        app._render(snap)
+        self.assertEqual(app.cards['storage'].disk_cards, {})
+        reconnected = present('presence:2', 'physical-A')
+        self.assertIsNot(reconnected, first)
+        self.assertTrue(reconnected.expander.get_expanded())
+        replacement = present('presence:3', 'physical-B')
+        self.assertFalse(replacement.expander.get_expanded())
+        app.stack.set_visible_child_name('storage')
+        self.assertEqual(list(app.cards['storage'].disk_cards.values()), [replacement])
 
     def _resize(self, app, width, height=720):
         app.window.set_default_size(width, height)
@@ -186,6 +414,28 @@ class GuiSmoke(unittest.TestCase):
         self.assertTrue(success)
         return bounds
 
+    def test_page_switching_preserves_independent_scroll_positions(self):
+        app = self._app()
+        snap = full_snapshot(n_gpus=5)
+        snap.disks[0].partitions = [PartitionMetrics(f'nvme0n1p{i}', fstype='ext4') for i in range(30)]
+        app._render(snap)
+        next(iter(app.cards['storage'].disk_cards.values())).expander.set_expanded(True)
+        self._resize(app, 380)
+        performance = app.pages['performance'].get_vadjustment()
+        self.assertGreater(performance.get_upper() - performance.get_page_size(), 100)
+        performance.set_value(100)
+        app.stack.set_visible_child_name('storage')
+        self._resize(app, 380)
+        storage = app.pages['storage'].get_vadjustment()
+        self.assertGreater(storage.get_upper() - storage.get_page_size(), 200)
+        storage.set_value(200)
+        app.stack.set_visible_child_name('performance')
+        self._resize(app, 380)
+        self.assertAlmostEqual(performance.get_value(), 100, delta=1)
+        app.stack.set_visible_child_name('storage')
+        self._resize(app, 380)
+        self.assertAlmostEqual(storage.get_value(), 200, delta=1)
+
     def test_responsive_layout_reflows_without_recreating_cards_or_expanders(self):
         app = self._app()
         snap = full_snapshot()
@@ -207,8 +457,6 @@ class GuiSmoke(unittest.TestCase):
         wide_left, wide_right = self._bounds(left, columns), self._bounds(right, columns)
         self.assertAlmostEqual(wide_left.get_y(), wide_right.get_y(), delta=1)
         self.assertGreater(wide_right.get_x(), wide_left.get_x())
-        self.assertLess(self._bounds(storage, scroller).get_y(), scroller.get_height())
-        self.assertLess(self._bounds(storage, columns).get_y(), wide_left.get_height())
 
         disk.expander.set_expanded(True)
         for width, height in ((480, 720), (380, 320), (1000, 720)):
@@ -235,7 +483,17 @@ class GuiSmoke(unittest.TestCase):
             self.assertTrue(disk.expander.get_expanded())
             self.assertTrue(bar.get_visible())
             self.assertIs(left, app.cards['cpu'].get_parent())
-            self.assertIs(right, storage.get_parent())
+            self.assertIs(right, app.cards['gpu'].get_parent())
+            app.stack.set_visible_child_name('storage')
+            self._resize(app, width, height)
+            storage_scroller = app.pages['storage']
+            self.assertLessEqual(storage.measure(Gtk.Orientation.HORIZONTAL, -1)[0], storage.get_width())
+            adjustment = storage_scroller.get_hadjustment()
+            self.assertLessEqual(adjustment.get_upper(), adjustment.get_page_size() + 1)
+            self.assertIs(next(iter(storage.disk_cards.values())), disk)
+            self.assertTrue(disk.expander.get_expanded())
+            app.stack.set_visible_child_name('performance')
+            self._resize(app, width, height)
 
     def test_long_names_diagnostics_and_temperature_ages_fit_a_narrow_window(self):
         app = self._app(panels={'sensors': True})
@@ -250,19 +508,50 @@ class GuiSmoke(unittest.TestCase):
         with mock.patch('src.gui.app.time.monotonic', return_value=296):
             app._render(snap)
             app._update_status(snap)
-        self._resize(app, 380)
-        for card in app.cards.values():
-            self.assertLessEqual(card.measure(Gtk.Orientation.HORIZONTAL, -1)[0], card.get_width())
+        for page in ('performance', 'storage'):
+            app.stack.set_visible_child_name(page)
+            self._resize(app, 380)
+            for card in app.cards.values():
+                if card.get_ancestor(Gtk.ScrolledWindow) is app.pages[page]:
+                    self.assertLessEqual(card.measure(Gtk.Orientation.HORIZONTAL, -1)[0], card.get_width())
         disk = next(iter(app.cards['storage'].disk_cards.values()))
         self.assertIn('hace 296 s', disk.temperature.get_label())
         self.assertIn('Permission denied', app.status.get_tooltip_text())
         self.assertNotIn('Permission denied', app.status.get_label())
+
+    def test_expanded_details_and_horizontal_disk_summary_fit_narrow_windows_in_both_themes(self):
+        for theme in ('dark', 'system'):
+            with self.subTest(theme=theme):
+                app = self._app(theme=theme)
+                self.assertEqual(app.window.has_css_class('monitor-dark'), theme == 'dark')
+                snap = full_snapshot(n_gpus=2)
+                snap.cpu.model = 'CPU_' + 'x' * 120
+                snap.gpus[1].name = 'GPU_' + 'x' * 120
+                app._render(snap)
+                for name in ('cpu', 'ram', 'gpu'):
+                    app.cards[name]._sections['details'].set_expanded(True)
+                disk = next(iter(app.cards['storage'].disk_cards.values()))
+                disk.expander.set_expanded(True)
+                for page in ('performance', 'storage'):
+                    app.stack.set_visible_child_name(page)
+                    self._resize(app, 380)
+                    scroller = app.pages[page]
+                    horizontal = scroller.get_hadjustment()
+                    self.assertLessEqual(horizontal.get_upper(), horizontal.get_page_size() + 1)
+                    for card in app.cards.values():
+                        if card.get_ancestor(Gtk.ScrolledWindow) is scroller:
+                            self.assertLessEqual(card.measure(Gtk.Orientation.HORIZONTAL, -1)[0], card.get_width())
+                left = self._bounds(disk.capacity_box, disk.overview)
+                right = self._bounds(disk.summary, disk.overview)
+                self.assertGreaterEqual(right.get_x(), left.get_x() + left.get_width())
+                self.assertLessEqual(right.get_x() + right.get_width(), disk.overview.get_width() + 1)
 
     def test_one_enabled_column_uses_the_available_width_and_no_panels_still_fits(self):
         for enabled in ('cpu', 'storage', None):
             with self.subTest(enabled=enabled):
                 app = self._app(panels={name: name == enabled for name in ('cpu', 'gpu', 'ram', 'storage', 'sensors')})
                 app._render(full_snapshot())
+                app.stack.set_visible_child_name('storage' if enabled == 'storage' else 'performance')
                 self._resize(app, 380)
                 self.assertEqual(set(app.cards), {enabled} if enabled else set())
                 if enabled:

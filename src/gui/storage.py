@@ -16,15 +16,21 @@ from src.utils.formatting import fmt_bytes, fmt_temp, usage_level
 
 STORAGE_CSS = """
 .storage-panel { padding: 0; background-color: transparent; border: none; }
-.storage-disk { padding: 10px 12px; }
-.storage-disk expander > title { padding: 0; }
+.storage-disk { padding: 14px; }
+.storage-disk expander > title { padding: 0; border-radius: 6px; }
 .storage-main { font-weight: 700; }
+.storage-title { font-size: 115%; font-weight: 700; }
+.storage-capacity { font-size: 160%; font-weight: 700; }
+.storage-temperature { font-size: 110%; font-weight: 600; }
+.storage-caption { font-size: 75%; opacity: 0.75; margin-top: 4px; }
+.storage-overview { margin: 8px 0; }
+.storage-details > title { padding: 4px 0; font-size: 90%; }
 .storage-secondary { font-size: 85%; opacity: 0.8; }
 .storage-status { font-size: 85%; }
-.storage-partition { padding: 8px 0 4px 12px; }
+.storage-partition { padding: 10px 0 6px 12px; }
 .storage-stale { opacity: 0.7; }
-.storage-partition progressbar trough, .storage-partition progressbar progress { min-height: 5px; }
-.storage-disk progressbar.hw-bar trough, .storage-disk progressbar.hw-bar progress { min-height: 5px; }
+.storage-partition progressbar trough, .storage-partition progressbar progress { min-height: 6px; }
+.storage-disk progressbar.hw-bar trough, .storage-disk progressbar.hw-bar progress { min-height: 6px; }
 """
 
 
@@ -155,37 +161,59 @@ class PartitionRow(Gtk.Box):
 
 class DiskCard(Gtk.Box):
     def __init__(self, key, expanded=False):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.key = key
         self.add_css_class("hw-card")
         self.add_css_class("storage-disk")
         self.set_hexpand(True)
         self.expander = Gtk.Expander()
+        self.expander.set_label("Particiones y detalles")
+        self.expander.add_css_class("storage-details")
         self.expander.set_expanded(expanded)
         self.expander.set_hexpand(True)
-        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-        header.set_hexpand(True)
-        line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.title = label("storage-main")
-        self.temperature = Gtk.Label(xalign=1)
+        self.title = label("storage-title")
+        self.temperature = Gtk.Label(xalign=0)
         self.temperature.set_wrap(True)
         self.temperature.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.temperature.set_max_width_chars(24)
-        self.temperature.add_css_class("storage-secondary")
-        line.append(self.title)
-        line.append(self.temperature)
+        self.temperature.set_max_width_chars(10)
+        self.temperature.set_halign(Gtk.Align.START)
+        self.temperature.add_css_class("storage-temperature")
         self.technical = label("storage-secondary")
         self.model = label("storage-secondary")
         self.status = label("storage-status")
+        self.capacity = Gtk.Label(xalign=0)
+        self.capacity.add_css_class("storage-capacity")
+        self.device_summary = label("storage-main")
+        self.partition_summary = label("storage-secondary")
         self.usage_scope = label("storage-secondary")
         self.usage = label("storage-secondary")
         self.usage_bar = Gtk.ProgressBar()
         self.usage_bar.add_css_class("hw-bar")
         self.usage_warning = label("storage-status")
-        for child in (line, self.technical, self.model, self.status, self.usage_scope, self.usage, self.usage_warning, self.usage_bar):
-            header.append(child)
-        self.expander.set_label_widget(header)
+        for child in (self.title, self.model):
+            self.append(child)
+        # This compact region already carries real data. A later phase can add
+        # a donut here without reserving a blank canvas or changing reconciliation.
+        self.overview = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        self.overview.add_css_class("storage-overview")
+        self.capacity_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.capacity_box.set_size_request(110, -1)
+        self.capacity_box.set_valign(Gtk.Align.START)
+        for text, widget in (("CAPACIDAD", self.capacity), ("TEMPERATURA", self.temperature)):
+            caption = Gtk.Label(label=text, xalign=0)
+            caption.add_css_class("storage-caption")
+            self.capacity_box.append(caption)
+            self.capacity_box.append(widget)
+        self.summary = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.summary.set_hexpand(True)
+        for child in (self.device_summary, self.partition_summary, self.usage_scope,
+                      self.usage, self.usage_warning, self.usage_bar, self.status):
+            self.summary.append(child)
+        self.overview.append(self.capacity_box)
+        self.overview.append(self.summary)
+        self.append(self.overview)
         self.partitions_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.partitions_box.append(self.technical)
         self.expander.set_child(self.partitions_box)
         self.append(self.expander)
         self.partition_rows = {}
@@ -241,12 +269,16 @@ class DiskCard(Gtk.Box):
 
     def update(self, disk, alias, snap, now, unit, medium, high):
         model = (disk.model or "").strip()
-        set_label(self.title, model if model and model != "N/D" else disk.name)
-        set_label(self.technical, f"{disk.kind} · {disk.name} · {fmt_bytes(disk.size_bytes).replace('.', ',')}")
-        # Alias configuration and persistent identity remain available, but the
-        # commercial model is always the title and needs no duplicate row.
+        has_model = bool(model and model != "N/D")
+        # Alias configuration and identity remain intact; the title identifies
+        # the physical hardware, with its technical name as the fallback.
+        set_label(self.title, model if has_model else disk.name)
+        transport = f" · {disk.transport}" if disk.transport != "N/D" else ""
+        set_label(self.technical, f"{disk.kind} · {disk.name} · {fmt_bytes(disk.size_bytes).replace('.', ',')}{transport}")
         self.model.set_visible(False)
         set_label(self.model, model or "")
+        set_label(self.capacity, fmt_bytes(disk.size_bytes).replace('.', ','))
+        set_label(self.device_summary, f"{disk.kind} · {disk.name}")
         topology = snap.sources.get("topology")
         temperature_key = disk.temperature_source or next((key for key in (
             "temperature:" + disk.name, "udisks:" + disk.name, "smart:" + disk.name
@@ -295,7 +327,21 @@ class DiskCard(Gtk.Box):
             messages.append("Actualizado" + (" · " + age_text(state, now) if state else ""))
         set_label(self.status, " · ".join(dict.fromkeys(messages)), "\n".join(details))
         self.technical.set_tooltip_text(f"Capacidad/topología: {state_detail(topology, now)}\n{self.technical.get_label()}")
+        self.capacity.set_tooltip_text(self.technical.get_tooltip_text())
         partitions = display_partitions(disk.partitions)
+        volumes = [disk.direct_filesystem] if disk.direct_filesystem is not None else partitions
+        summaries = []
+        for part in volumes:
+            mount = ", ".join(part.mountpoints) or "Sin montar"
+            summaries.append(f"{partition_title(part)} · {part.fstype} · {mount}")
+        mounted = sum(any(path.startswith("/") for path in part.mountpoints) for part in volumes)
+        count = len(volumes)
+        if count:
+            mounting = f"{mounted} {'montado' if mounted == 1 else 'montados'}" if mounted else "Sin montar"
+            text = f"{count} {'volumen' if count == 1 else 'volúmenes'} · {mounting}"
+        else:
+            text = "Sin particiones"
+        set_label(self.partition_summary, text, "\n".join(summaries) or text)
         self._update_usage(partitions, snap, now, medium, high, disk.direct_filesystem)
         self.empty.set_visible(not partitions)
         active = set()
@@ -318,6 +364,7 @@ class DiskCard(Gtk.Box):
 class StoragePanel(MetricCard):
     def __init__(self, unit="C", medium=60, high=85):
         super().__init__("Almacenamiento")
+        self.body.set_spacing(12)
         self.remove_css_class("hw-card")
         self.add_css_class("storage-panel")
         self.unit, self.medium, self.high = unit, medium, high

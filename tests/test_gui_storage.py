@@ -109,6 +109,87 @@ class StorageGui(unittest.TestCase):
         self.assertEqual(len(card.partition_rows), 1)
         self.assertTrue(card.expander.get_expanded())
 
+    def test_collapsed_card_keeps_capacity_temperature_mount_summary_and_usage_outside_details(self):
+        from gi.repository import Gtk
+        part = PartitionMetrics('sda1', fstype='ext4', mountpoints=['/data'],
+                                used_bytes=60, free_bytes=20, usage_percent=75)
+        snap = self.usage_snapshot(part)
+        snap.disks[0].temperature_c = 38
+        snap.sources['smart:sda'] = SourceState(0, 0, 15)
+        self.panel.update(snap, 1)
+        card = self.card('sda')
+        self.assertFalse(card.expander.get_expanded())
+        for widget in (card.title, card.capacity, card.temperature, card.partition_summary,
+                       card.usage, card.usage_bar, card.status):
+            self.assertIsNone(widget.get_ancestor(Gtk.Expander))
+            self.assertTrue(widget.get_visible())
+        self.assertIn('38,0 °C', card.temperature.get_label())
+        self.assertEqual(card.partition_summary.get_label(), '1 volumen · 1 montado')
+        self.assertIn('/data', card.partition_summary.get_tooltip_text())
+        self.assertEqual(card.overview.get_orientation(), Gtk.Orientation.HORIZONTAL)
+        self.assertIs(card.summary.get_parent(), card.overview)
+        card.expander.set_expanded(True)
+        self.assertIs(card.technical.get_ancestor(Gtk.Expander), card.expander)
+        card.expander.set_expanded(False)
+        part.mountpoints = []
+        self.panel.update(snap, 2)
+        self.assertEqual(card.partition_summary.get_label(), '1 volumen · Sin montar')
+        self.assertFalse(card.usage_bar.get_visible())
+
+    def test_alias_changes_preserve_model_title_widgets_and_configuration(self):
+        self.identify('sda', 'wwn-example-A')
+        self.aliases({'wwn-example-A': 'Respaldo'})
+        disk = DiskMetrics('sda', model='Kingston', partitions=[PartitionMetrics('sda1', label='Windows 11')])
+        self.panel.update(self.snapshot(disk), 0)
+        card = self.card('sda')
+        card.expander.set_expanded(True)
+        title, model = card.title, card.model
+        row = next(iter(card.partition_rows.values()))
+        for alias in ('Archivo', 'Kingston', '', '  '):
+            self.aliases({'wwn-example-A': alias})
+            prepared = self.snapshot(disk)
+            self.panel.update(prepared, 1)
+            self.assertIs(self.card('sda'), card)
+            self.assertIs(card.title, title)
+            self.assertIs(card.model, model)
+            self.assertIs(next(iter(card.partition_rows.values())), row)
+            self.assertEqual(title.get_label(), 'Kingston')
+            self.assertFalse(model.get_visible())
+            self.assertEqual(dict(prepared.storage_presentation.identities)['sda'].alias, alias)
+            self.assertEqual(json.loads(self.config.read_text()), {'aliases': {'wwn-example-A': alias}})
+            self.assertTrue(card.expander.get_expanded())
+        disk.model = 'N/D'
+        self.panel.update(self.snapshot(disk), 2)
+        self.assertEqual(title.get_label(), 'sda')
+        disk.partitions[0].label = 'Fedora'
+        self.panel.update(self.snapshot(disk), 3)
+        self.assertEqual(title.get_label(), 'sda')
+
+    def test_alias_refresh_does_not_reanchor_or_reveal_expired_temperature(self):
+        self.identify('sda', 'wwn-example-A')
+        self.aliases({'wwn-example-A': 'Respaldo'})
+        disk = DiskMetrics('sda', model='Kingston', temperature_c=38, temperature_source='smart:sda')
+        state = SourceState(0, 0, 15)
+        snap = self.snapshot(disk)
+        snap.sources['smart:sda'] = state
+        self.panel.update(snap, 1)
+        card = self.card('sda')
+        temperature = card.temperature
+        card.expander.set_expanded(True)
+        self.aliases({'wwn-example-A': 'Archivo'})
+        updated = self.snapshot(disk, generation=1)
+        updated.sources['smart:sda'] = state
+        self.panel.update(updated, 20)
+        self.assertIs(card.temperature, temperature)
+        self.assertEqual(card.title.get_label(), 'Kingston')
+        self.assertEqual(dict(updated.storage_presentation.identities)['sda'].alias, 'Archivo')
+        self.assertEqual(temperature.get_label(), 'N/D')
+        self.assertIn('38.0 °C', temperature.get_tooltip_text())
+        self.assertIn('hace 20 s', temperature.get_tooltip_text())
+        self.assertIn('Datos obsoletos', card.status.get_label())
+        self.assertIs(updated.sources['smart:sda'], state)
+        self.assertTrue(card.expander.get_expanded())
+
     def test_labels_are_not_guessed_and_duplicates_keep_technical_ids(self):
         a = PartitionMetrics('sda1', fstype='ntfs', label='Windows')
         b = PartitionMetrics('sda2', fstype='ext4', label='Windows')
@@ -136,6 +217,7 @@ class StorageGui(unittest.TestCase):
         card = self.card('sda')
         rows = list(card.partition_rows.values())
         self.assertEqual(card.title.get_label(), disk.model)
+        self.assertEqual(card.model.get_label(), disk.model)
         self.assertEqual([row.title.get_label() for row in rows], ['Respaldo', 'BIOS_GIGABY'])
         self.assertEqual(rows[0].details.get_label(), 'sda1 · ntfs · 1.0 GiB · /data')
         self.assertIn('sda2 · vfat', rows[1].details.get_label())
@@ -148,7 +230,7 @@ class StorageGui(unittest.TestCase):
         self.assertEqual(rows[0].title.get_label(), 'Etiqueta actualizada')
         self.assertTrue(card.expander.get_expanded())
 
-    def test_missing_models_and_labels_use_technical_names_even_with_alias(self):
+    def test_missing_models_and_partition_labels_use_technical_names_even_with_alias(self):
         self.identify('sda', 'wwn-example-A')
         self.aliases({'wwn-example-A': 'Respaldo'})
         part = PartitionMetrics('sda1', fstype='ntfs')

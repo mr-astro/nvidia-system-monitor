@@ -29,6 +29,7 @@ class MetricCard(Gtk.Box):
         self.append(self.body)
 
         self._rows: dict = {}
+        self._sections: dict = {}
         self._signature = None
 
     def reset(self, signature) -> None:
@@ -41,11 +42,37 @@ class MetricCard(Gtk.Box):
             self.body.remove(child)
             child = following
         self._rows.clear()
+        self._sections.clear()
         self._signature = signature
 
-    def _create_row(self, key: str, bar: bool):
+    def _section(self, name, detail=False):
+        if name not in self._sections:
+            if detail:
+                content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                expander = Gtk.Expander(label="Detalles técnicos")
+                expander.add_css_class("metric-details")
+                expander.set_child(content)
+                self.body.append(expander)
+            else:
+                content = Gtk.FlowBox()
+                content.set_selection_mode(Gtk.SelectionMode.NONE)
+                content.set_min_children_per_line(1)
+                content.set_max_children_per_line(2)
+                content.set_homogeneous(True)
+                content.set_column_spacing(12)
+                content.set_row_spacing(6)
+                content.add_css_class("metric-highlights")
+                self.body.append(content)
+            self._sections[name] = expander if detail else content
+        widget = self._sections[name]
+        return widget.get_child() if detail else widget
+
+    def _create_row(self, key: str, bar: bool, presentation, section):
         container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        prominent = presentation in {"hero", "tile", "feature", "model"}
+        stacked = prominent and presentation != "hero"
+        line = Gtk.Box(orientation=Gtk.Orientation.VERTICAL if stacked else Gtk.Orientation.HORIZONTAL,
+                       spacing=2 if stacked else 12)
         key_label = Gtk.Label()
         key_label.set_xalign(0)
         key_label.set_hexpand(True)
@@ -54,13 +81,27 @@ class MetricCard(Gtk.Box):
         key_label.set_max_width_chars(20)
         key_label.add_css_class("hw-key")
         value_label = Gtk.Label()
-        value_label.set_xalign(1)
+        value_label.set_xalign(0 if prominent or presentation == "note" else 1)
         value_label.set_wrap(True)
         value_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         value_label.set_max_width_chars(44)
         value_label.add_css_class("hw-value")
-        line.append(key_label)
-        line.append(value_label)
+        if prominent:
+            container.add_css_class("metric-" + presentation)
+            value_label.add_css_class("metric-" + presentation + "-value")
+            value_label.set_hexpand(presentation != "hero")
+        if presentation in {"note", "model"}:
+            key_label.set_visible(False)
+        if presentation == "note":
+            value_label.add_css_class("metric-note")
+            value_label.set_hexpand(True)
+        if presentation == "hero":
+            key_label.set_valign(Gtk.Align.END)
+            line.append(value_label)
+            line.append(key_label)
+        else:
+            line.append(key_label)
+            line.append(value_label)
         container.append(line)
 
         progress = None
@@ -69,12 +110,20 @@ class MetricCard(Gtk.Box):
             progress.add_css_class("hw-bar")
             container.append(progress)
 
-        self.body.append(container)
+        if presentation == "tile":
+            container.set_size_request(120, -1)
+            self._section(section or "highlights").append(container)
+            container.get_parent().set_focusable(False)
+        elif presentation == "detail":
+            self._section(section or "details", detail=True).append(container)
+        else:
+            self.body.append(container)
         self._rows[key] = (key_label, value_label, progress)
         return self._rows[key]
 
-    def set_row(self, key, label, value, percent=None, level=None, bar=False) -> None:
-        entry = self._rows.get(key) or self._create_row(key, bar)
+    def set_row(self, key, label, value, percent=None, level=None, bar=False,
+                *, presentation="row", section=None) -> None:
+        entry = self._rows.get(key) or self._create_row(key, bar, presentation, section)
         key_label, value_label, progress = entry
         _set_text(key_label, label)
         _set_text(value_label, str(value))

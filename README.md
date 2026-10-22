@@ -239,17 +239,28 @@ valores inválidos se ignoran y se usa el valor por defecto.
 El código lee `storage-aliases.json` en el directorio de configuración del canal y
 resuelve identidades mediante enlaces existentes de discos completos en
 `/dev/disk/by-id`, dando preferencia a WWN. No existe una interfaz para editar
-alias; los nombres configurados tampoco sustituyen los títulos. Las tarjetas
-siempre muestran el modelo detectado o el nombre técnico cuando falta el modelo.
+alias. Su configuración y resolución se conservan internamente, pero no se utilizan
+como título: las tarjetas muestran el modelo detectado o el nombre técnico cuando
+falta el modelo. No se deducen alias a partir de particiones, sistemas de archivos
+ni puntos de montaje.
 No se guardan identificadores reales de discos en el repositorio. Las
 particiones se despliegan por disco y conservan su estado durante las actualizaciones.
 Los diagnósticos completos están en tooltips; las fuentes obsoletas mantienen su aviso.
 
-En ventanas anchas, CPU y RAM comparten la columna izquierda; GPU y Almacenamiento,
-la derecha. `Gtk.FlowBox` reorganiza estas columnas en una sola al reducir el ancho,
-sin reconstruir tarjetas ni perder los expanders. La ventana inicia en 1000 × 720,
-con un mínimo de 380 × 320; el contenido conserva su altura natural y se desplaza
-verticalmente cuando es necesario.
+La interfaz de esta rama tiene dos pestañas, **RENDIMIENTO** y **ALMACENAMIENTO**,
+con desplazamiento independiente. En Rendimiento, CPU y RAM comparten la columna
+izquierda y GPU ocupa la derecha; los sensores opcionales aparecen junto a CPU y
+RAM. `Gtk.FlowBox` reorganiza estas columnas al reducir el ancho, sin reconstruir
+tarjetas ni perder los desplegables. Los porcentajes de utilización, temperaturas,
+VRAM y consumo tienen mayor tamaño; las demás métricas siguen disponibles en
+«Detalles técnicos». La ventana inicia en 880 × 700, con un mínimo de 380 × 320,
+y se desplaza verticalmente cuando es necesario. El indicador DEV identifica el
+canal sin repetir el título de la ventana.
+
+En Almacenamiento, cada tarjeta conserva capacidad y temperatura a la izquierda,
+y el resumen del dispositivo, montajes y uso a la derecha. El resumen permanece
+visible al contraer «Particiones y detalles». No se incorporan gráficos de dona,
+históricos ni nuevas consultas SMART en esta fase visual.
 
 La cabecera indica cuándo se recibió la última instantánea y nombra las fuentes
 con avisos. Las temperaturas SMART y UDisks2 muestran su antigüedad en la tarjeta

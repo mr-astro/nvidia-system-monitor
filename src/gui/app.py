@@ -43,15 +43,34 @@ MAX_SENSOR_ROWS = 24
 
 
 LEFT_PANELS = ("cpu", "ram", "sensors")
-RIGHT_PANELS = ("gpu", "storage")
+RIGHT_PANELS = ("gpu",)
 MIN_COLUMN_WIDTH = 340
 
 _BASE_CSS = """
-.hw-heading, .hw-title {{ font-weight: 700; margin-bottom: 8px; }}
-.hw-card {{ padding: 12px; border-radius: 8px; }}
+.hw-heading {{ font-size: 115%; font-weight: 700; }}
+.hw-title {{ font-weight: 700; margin-bottom: 6px; }}
+.hw-card {{ padding: 12px; border-radius: 12px; }}
 .hw-key {{ font-size: 85%; }}
 .hw-value {{ font-size: 85%; font-weight: 500; font-feature-settings: "tnum"; }}
+.monitor-status {{ font-size: 85%; opacity: 0.85; }}
+.monitor-switcher {{ margin-bottom: 2px; }}
+.monitor-switcher button {{ padding: 9px 16px; border-radius: 8px; }}
+.monitor-switcher label {{ font-size: 85%; font-weight: 700; }}
+.monitor-empty {{ padding: 24px 12px; opacity: 0.8; }}
 .monitor-layout > flowboxchild {{ padding: 0; }}
+.metric-highlights > flowboxchild {{ padding: 0; }}
+.metric-hero {{ margin: 2px 0 4px; }}
+.metric-hero-value {{ font-size: 275%; font-weight: 700; }}
+.metric-tile {{ padding: 4px 0; }}
+.metric-tile-value {{ font-size: 150%; font-weight: 600; }}
+.metric-feature {{ margin: 4px 0; }}
+.metric-feature-value {{ font-size: 115%; font-weight: 600; }}
+.metric-model {{ margin-bottom: 4px; }}
+.metric-model-value {{ font-size: 100%; font-weight: 600; }}
+.metric-note {{ font-size: 80%; opacity: 0.75; font-weight: 400; }}
+.metric-details {{ margin-top: 8px; font-size: 90%; }}
+.metric-details > title {{ padding: 4px 0; }}
+.monitor-channel {{ font-size: 85%; font-weight: 700; border-radius: 6px; padding: 4px 8px; }}
 progressbar.hw-bar trough, progressbar.hw-bar progress {{ min-height: 6px; border-radius: 3px; }}
 progressbar.usage-low progress {{ background-image: none; background-color: {low}; }}
 progressbar.usage-medium progress {{ background-image: none; background-color: {medium}; }}
@@ -65,22 +84,30 @@ _SYSTEM_CSS = """
     background-color: rgba(128, 128, 128, 0.08);
 }
 .hw-key { opacity: 0.75; }
+.monitor-switcher button:checked { font-weight: 700; }
 """
 
 # Explicit dark palette. Independent of the GTK version (the
 # gtk-application-prefer-dark-theme setting is deprecated since GTK 4.20).
 _DARK_CSS = """
-window { background-color: #1e1e1e; color: #e0e0e0; }
-headerbar { background-color: #2d2d2d; color: #ffffff; border-bottom: 1px solid #3d3d3d; }
-headerbar label { color: #ffffff; font-weight: bold; }
-headerbar button { background-color: #3d3d3d; color: #ffffff; border: none; border-radius: 4px; }
-headerbar button:hover { background-color: #4d4d4d; }
-label { color: #e0e0e0; }
-.hw-card { background-color: #2d2d2d; border: 1px solid #3d3d3d; }
-.hw-title, .hw-heading { color: #ffffff; }
-.hw-key { color: #b0b0b0; }
-.hw-value { color: #e0e0e0; }
-progressbar.hw-bar trough { background-color: #3d3d3d; }
+.monitor-window.monitor-dark { background-color: #101410; color: #F2F5F2; }
+.monitor-window.monitor-dark headerbar { background-color: #1B231C; color: #F2F5F2; border-bottom: 1px solid #303C31; }
+.monitor-window.monitor-dark label { color: #F2F5F2; }
+.monitor-window.monitor-dark .hw-card { background-color: #1B231C; border: 1px solid #303C31; }
+.monitor-window.monitor-dark .hw-key,
+.monitor-window.monitor-dark .monitor-status,
+.monitor-window.monitor-dark .storage-secondary,
+.monitor-window.monitor-dark .storage-status { color: #A5B0A5; }
+.monitor-window.monitor-dark progressbar.hw-bar trough { background-color: #303C31; }
+.monitor-window.monitor-dark .monitor-switcher button {
+    background-image: none; background-color: #1B231C;
+    border: 1px solid #303C31; box-shadow: none;
+}
+.monitor-window.monitor-dark .monitor-switcher button:hover { background-color: #283529; }
+.monitor-window.monitor-dark .monitor-switcher button:checked { background-color: #76B900; border-color: #76B900; }
+.monitor-window.monitor-dark .monitor-switcher button:checked label { color: #101410; }
+.monitor-window.monitor-dark .storage-panel { background-color: transparent; border: none; }
+.monitor-window.monitor-dark .monitor-channel { color: #76B900; background-color: #1B231C; }
 """
 
 
@@ -183,44 +210,63 @@ class SystemMonitorApp(Gtk.Application):
 
     def _build_window(self) -> None:
         self.window = Gtk.ApplicationWindow(application=self)
+        self.window.add_css_class("monitor-window")
+        if self.dark:
+            self.window.add_css_class("monitor-dark")
         self.window.set_title(self.channel.title)
         self.window.set_icon_name(self.channel.icon_name)
-        self.window.set_default_size(1000, 720)
+        self.window.set_default_size(880, 700)
         self.window.set_size_request(380, 320)
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         for setter in (root.set_margin_top, root.set_margin_bottom,
                        root.set_margin_start, root.set_margin_end):
-            setter(16)
+            setter(14)
         self.window.set_child(root)
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        title = Gtk.Label(label="Hardware Monitor")
+        title = Gtk.Label(label="DEV" if self.channel.name == "dev" else "SISTEMA")
+        title.set_tooltip_text(self.channel.title)
         title.set_xalign(0)
-        title.set_hexpand(True)
         title.set_ellipsize(Pango.EllipsizeMode.END)
-        title.add_css_class("hw-heading")
+        title.add_css_class("monitor-channel")
         header.append(title)
         self.status = Gtk.Label(label="Recopilando datos…")
+        self.status.add_css_class("monitor-status")
         self.status.set_xalign(1)
+        self.status.set_hexpand(True)
         self.status.set_ellipsize(Pango.EllipsizeMode.END)
         self.status.set_max_width_chars(40)
         header.append(self.status)
         root.append(header)
 
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_hexpand(True)
-        scroller.set_vexpand(True)
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        root.append(scroller)
+        self.stack = Gtk.Stack()
+        self.stack.set_hexpand(True)
+        self.stack.set_vexpand(True)
+        self.stack.set_hhomogeneous(False)
+        self.stack.set_vhomogeneous(False)
+        self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        self.switcher = Gtk.StackSwitcher()
+        self.switcher.add_css_class("monitor-switcher")
+        self.switcher.set_halign(Gtk.Align.CENTER)
+        self.switcher.set_stack(self.stack)
+        root.append(self.switcher)
+        root.append(self.stack)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        scroller.set_child(content)
-
-        if not self.enabled:
-            empty = Gtk.Label(label="Ningún panel habilitado en la configuración.")
-            empty.set_wrap(True)
-            content.append(empty)
+        # Pages and cards stay attached for the lifetime of the window. Switching
+        # pages changes visibility only; the existing render loop updates both.
+        self.pages = {}
+        contents = {}
+        for name, page_title in (("performance", "RENDIMIENTO"), ("storage", "ALMACENAMIENTO")):
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_hexpand(True)
+            scroller.set_vexpand(True)
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            scroller.set_child(content)
+            self.pages[name] = scroller
+            contents[name] = content
+            self.stack.add_titled(scroller, name, page_title)
 
         # GTK reflows the two independent groups using their minimum widths.
         # Unequal row heights keep the single-column layout compact. Cards never
@@ -248,7 +294,25 @@ class SystemMonitorApp(Gtk.Application):
             columns.append(column)
             column.get_parent().set_focusable(False)
         if columns.get_first_child() is not None:
-            content.append(columns)
+            # A single enabled group should fill the row, while two groups keep
+            # independent heights when they wrap onto separate lines.
+            columns.set_homogeneous(columns.get_first_child() is columns.get_last_child())
+            contents["performance"].append(columns)
+        else:
+            self._append_empty(contents["performance"], "No hay paneles de rendimiento habilitados.")
+
+        if "storage" in self.enabled:
+            self.cards["storage"] = self._new_card("storage")
+            contents["storage"].append(self.cards["storage"])
+        else:
+            self._append_empty(contents["storage"], "El panel de almacenamiento está deshabilitado.")
+
+    @staticmethod
+    def _append_empty(content, text):
+        empty = Gtk.Label(label=text)
+        empty.set_wrap(True)
+        empty.add_css_class("monitor-empty")
+        content.append(empty)
 
     def _new_card(self, name):
         if name == "storage":
@@ -347,7 +411,7 @@ class SystemMonitorApp(Gtk.Application):
                 else:
                     renderers[name](card, snap)
                     if state and name != "storage":
-                        card.set_row("freshness", "Medición", self._source_note(state, now))
+                        card.set_row("freshness", "Medición", self._source_note(state, now), presentation="note")
                 if card is not target:
                     target.remove(target.body)
                     body = card.body
@@ -355,6 +419,7 @@ class SystemMonitorApp(Gtk.Application):
                     target.body = body
                     target.append(body)
                     target._rows = card._rows
+                    target._sections = card._sections
                     target._signature = card._signature
                     if name == "storage":
                         target.disk_cards = card.disk_cards
@@ -385,15 +450,15 @@ class SystemMonitorApp(Gtk.Application):
         if c is None:
             return self._no_data(card)
         card.reset(("cpu",))
-        card.set_row("model", "Modelo", c.model)
+        card.set_row("model", "Procesador", c.model, presentation="model")
         card.set_row("usage", "Uso", fmt(c.usage_percent, "%"),
-                     c.usage_percent, self._level(c.usage_percent), bar=True)
-        card.set_row("freq", "Frecuencia", fmt(c.frequency_mhz, " MHz", 0))
-        card.set_row("maxfreq", "Máxima", fmt(c.max_frequency_mhz, " MHz", 0))
-        card.set_row("temp", "Temperatura", fmt_temp(c.temperature_c, self.unit))
-        card.set_row("cores", "Núcleos / hilos", f"{c.cores} / {c.threads}")
+                     c.usage_percent, self._level(c.usage_percent), bar=True, presentation="hero")
+        card.set_row("temp", "Temperatura", fmt_temp(c.temperature_c, self.unit), presentation="tile")
+        card.set_row("freq", "Frecuencia", fmt(c.frequency_mhz, " MHz", 0), presentation="tile")
+        card.set_row("maxfreq", "Máxima", fmt(c.max_frequency_mhz, " MHz", 0), presentation="detail")
+        card.set_row("cores", "Núcleos / hilos", f"{c.cores} / {c.threads}", presentation="detail")
         card.set_row("load", "Carga (1/5/15 min)",
-                     f"{fmt(c.load_1m)} / {fmt(c.load_5m)} / {fmt(c.load_15m)}")
+                     f"{fmt(c.load_1m)} / {fmt(c.load_5m)} / {fmt(c.load_15m)}", presentation="detail")
 
     def _render_gpu(self, card: MetricCard, snap: Snapshot) -> None:
         if not snap.gpus:
@@ -406,40 +471,48 @@ class SystemMonitorApp(Gtk.Application):
         for position, g in enumerate(snap.gpus):
             p = f"gpu{position}:"
             tag = f"GPU {g.index if g.index is not None else position} · " if multi else ""
-            card.set_row(p + "name", tag + "Modelo", g.name)
+            card.set_row(p + "name", tag + "Modelo", g.name, presentation="model")
+            card._rows[p + "name"][0].set_visible(multi)
             card.set_row(p + "usage", tag + "Uso", fmt(g.utilization_percent, "%"),
-                         g.utilization_percent, self._level(g.utilization_percent), bar=True)
+                         g.utilization_percent, self._level(g.utilization_percent), bar=True, presentation="hero")
             card.set_row(p + "vram", tag + "VRAM",
                          f"{fmt_mb(g.memory_used_mb)} / {fmt_mb(g.memory_total_mb)} "
                          f"({fmt(g.memory_percent, '%')})",
-                         g.memory_percent, self._level(g.memory_percent), bar=True)
-            card.set_row(p + "temp", tag + "Temperatura", fmt_temp(g.temperature_c, self.unit))
-            card.set_row(p + "power", tag + "Consumo", fmt(g.power_draw_w, " W"))
-            card.set_row(p + "limit", tag + "Límite potencia", fmt(g.power_limit_w, " W"))
-            card.set_row(p + "core", tag + "Core clock", fmt(g.core_clock_mhz, " MHz", 0))
-            card.set_row(p + "mem", tag + "Memory clock", fmt(g.memory_clock_mhz, " MHz", 0))
-            card.set_row(p + "fan", tag + "Ventilador", fmt(g.fan_percent, "%"))
-        card.set_row("driver", "Driver", snap.gpus[0].driver_version)
-        card.set_row("cuda", "CUDA", snap.cuda_version or "N/D")
+                         g.memory_percent, self._level(g.memory_percent), bar=True, presentation="feature")
+            card.set_row(p + "temp", tag + "Temperatura", fmt_temp(g.temperature_c, self.unit),
+                         presentation="tile", section=p + "highlights")
+            card.set_row(p + "power", tag + "Consumo", fmt(g.power_draw_w, " W"),
+                         presentation="tile", section=p + "highlights")
+        # Keep all technical values accessible below the GPU summaries.
+        for position, g in enumerate(snap.gpus):
+            p = f"gpu{position}:"
+            tag = f"GPU {g.index if g.index is not None else position} · " if multi else ""
+            card.set_row(p + "limit", tag + "Límite potencia", fmt(g.power_limit_w, " W"), presentation="detail")
+            card.set_row(p + "core", tag + "Core clock", fmt(g.core_clock_mhz, " MHz", 0), presentation="detail")
+            card.set_row(p + "mem", tag + "Memory clock", fmt(g.memory_clock_mhz, " MHz", 0), presentation="detail")
+            card.set_row(p + "fan", tag + "Ventilador", fmt(g.fan_percent, "%"), presentation="detail")
+        card.set_row("driver", "Driver", snap.gpus[0].driver_version, presentation="detail")
+        card.set_row("cuda", "CUDA", snap.cuda_version or "N/D", presentation="detail")
 
     def _render_ram(self, card: MetricCard, snap: Snapshot) -> None:
         r = snap.ram
         if r is None or r.total_mb is None:
             return self._no_data(card)
         card.reset(("ram", bool(r.swap_total_mb)))
-        card.set_row("total", "Total", fmt_mb(r.total_mb))
-        card.set_row("used", "Usada", f"{fmt_mb(r.used_mb)} ({fmt(r.usage_percent, '%')})",
-                     r.usage_percent, self._level(r.usage_percent), bar=True)
-        card.set_row("avail", "Disponible", fmt_mb(r.available_mb))
-        card.set_row("free", "Libre", fmt_mb(r.free_mb))
-        card.set_row("cache", "Caché y buffers", fmt_mb(r.cached_mb))
+        card.set_row("used", "Memoria en uso", fmt(r.usage_percent, '%'),
+                     r.usage_percent, self._level(r.usage_percent), bar=True, presentation="hero")
+        card.set_row("allocation", "Asignación", f"{fmt_mb(r.used_mb)} usados de {fmt_mb(r.total_mb)}", presentation="note")
+        card.set_row("avail", "Disponible", fmt_mb(r.available_mb), presentation="tile")
+        card.set_row("total", "Total", fmt_mb(r.total_mb), presentation="tile")
         if r.swap_total_mb:
             card.set_row("swap", "Swap",
                          f"{fmt_mb(r.swap_used_mb)} / {fmt_mb(r.swap_total_mb)} "
                          f"({fmt(r.swap_usage_percent, '%')})",
-                         r.swap_usage_percent, self._level(r.swap_usage_percent), bar=True)
+                         r.swap_usage_percent, self._level(r.swap_usage_percent), bar=True, presentation="feature")
         else:
             card.set_row("swap", "Swap", "No configurada")
+        card.set_row("free", "Libre", fmt_mb(r.free_mb), presentation="detail")
+        card.set_row("cache", "Caché y buffers", fmt_mb(r.cached_mb), presentation="detail")
 
     def _render_storage(self, card: StoragePanel, snap: Snapshot) -> None:
         card.update(snap, time.monotonic())
