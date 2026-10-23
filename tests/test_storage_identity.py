@@ -404,8 +404,9 @@ class ThermalIdentity(unittest.TestCase):
         for offset in range(10):
             self.now[0] = 100 + offset
             snapshot = collector.collect_once()
-            self.assertEqual(round(snapshot.disks[0].temperature_c), 38)
-            self.assertIsNone(snapshot.disks[1].temperature_c)
+            disks = {disk.name: disk for disk in snapshot.disks}
+            self.assertEqual(round(disks['sda'].temperature_c), 38)
+            self.assertIsNone(disks['sdb'].temperature_c)
         self.assertEqual(self.fetch.call_count, 1)
         self.assertEqual(self.monitor._run_lsblk.call_count, 1)
         self.assertEqual(logger.error.call_count, 1)
@@ -504,13 +505,13 @@ class KernelIdentity(unittest.TestCase):
         monitor._lsblk = '/synthetic/lsblk'
         output = json.dumps({'blockdevices': [{'name': 'sda', 'type': 'disk', 'wwn': '0x500a',
                                                'serial': 'synthetic-A', 'model': 'Synthetic'}]})
-        unsupported = SimpleNamespace(returncode=1, stdout='', stderr='unknown column DISKSEQ')
+        unsupported = SimpleNamespace(returncode=1, stdout='', stderr='unknown column DISK-SEQ')
         success = SimpleNamespace(returncode=0, stdout=output, stderr='')
         with mock.patch('src.data.storage.subprocess.run', side_effect=[unsupported, success]) as run:
             node, = monitor._run_lsblk()
         self.assertEqual(run.call_count, 2)
         self.assertEqual(probe('sda', node, self.root).wwn, '500a')
-        self.assertNotIn('DISKSEQ', monitor._lsblk_columns)
+        self.assertNotIn('DISK-SEQ', monitor._lsblk_columns)
         self.assertIn('WWN', monitor._lsblk_columns)
         with mock.patch('src.data.storage.subprocess.run', return_value=success) as run:
             monitor._run_lsblk()

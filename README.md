@@ -262,6 +262,12 @@ y el resumen del dispositivo, montajes y uso a la derecha. El resumen permanece
 visible al contraer «Particiones y detalles». No se incorporan gráficos de dona,
 históricos ni nuevas consultas SMART en esta fase visual.
 
+La fase 2A de esta rama ordena los discos por respaldo raíz verificado, NVMe,
+SATA/ATA, USB y otros transportes. Añade un modelo físico complementario para futuras
+donas, sin cambiar la composición visual ni sumar capas lógicas. La arquitectura,
+los límites de verificación y el procedimiento de validación real se describen en
+[Almacenamiento: fase 2A](docs/storage-topology.md).
+
 La cabecera indica cuándo se recibió la última instantánea y nombra las fuentes
 con avisos. Las temperaturas SMART y UDisks2 muestran su antigüedad en la tarjeta
 del disco; una lectura almacenada no hace parecer antiguas las demás métricas.

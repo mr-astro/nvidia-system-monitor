@@ -109,6 +109,45 @@ class StorageGui(unittest.TestCase):
         self.assertEqual(len(card.partition_rows), 1)
         self.assertTrue(card.expander.get_expanded())
 
+    def test_data_ordering_reuses_cards_and_expansion_across_reorder_and_hotplug(self):
+        from src.data.storage_order import disk_orders, order_disks
+        from tests.storage_fixtures import disk, part, presence, root_mount
+        nodes = [disk('nvme0n1', '259:0', 'nvme'), disk('sdb', '8:16', children=[
+                 part('sdb1', parent='sdb', number='8:17', mountpoints=['/'])]), disk()]
+        root = root_mount('/dev/sdb1', '8:17')
+        metrics = {node['name']: DiskMetrics(node['name'], partitions=[PartitionMetrics(node['name'] + '-part')])
+                   for node in nodes}
+        def publication(generation):
+            orders = disk_orders(nodes, {'/': root}, {('sdb1', '/'): root},
+                                 {node['name']: presence(node) for node in nodes})
+            values = []
+            for node in nodes:
+                metric = metrics.setdefault(node['name'], DiskMetrics(node['name']))
+                metric.order = orders[node['name']]
+                values.append(metric)
+            self.panel.update(self.snapshot(*order_disks(values), generation=generation), generation)
+            children, child = [], self.panel.body.get_first_child()
+            while child is not None:
+                children.append(child)
+                child = child.get_next_sibling()
+            return children
+        first = publication(0)
+        self.assertEqual(first, [self.card('sdb'), self.card('nvme0n1'), self.card('sda')])
+        original = {name: self.card(name) for name in metrics}
+        original['sdb'].expander.set_expanded(True)
+        row = next(iter(original['sdb'].partition_rows.values()))
+        nodes.reverse()
+        nodes.append(disk('sdc', '8:32', 'usb'))
+        connected = publication(1)
+        self.assertEqual(connected[:3], first)
+        self.assertIs(connected[-1], self.card('sdc'))
+        nodes.pop()
+        self.assertEqual(publication(2), first)
+        for name, card in original.items():
+            self.assertIs(self.card(name), card)
+        self.assertTrue(original['sdb'].expander.get_expanded())
+        self.assertIs(next(iter(original['sdb'].partition_rows.values())), row)
+
     def test_collapsed_card_keeps_capacity_temperature_mount_summary_and_usage_outside_details(self):
         from gi.repository import Gtk
         part = PartitionMetrics('sda1', fstype='ext4', mountpoints=['/data'],

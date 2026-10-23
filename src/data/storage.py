@@ -13,12 +13,16 @@ import re
 import shutil
 import subprocess
 import time
+from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from src.data.errors import SourceState, command_error, freshness
 from src.data.udisks import UDisksTemperature
 from src.data.identity import DeviceIdentity, Presence, probe, sequence
+from src.data.storage_layout import PhysicalLayout, build_layout
+from src.data.storage_order import BtrfsMembers, DiskOrder, device_number, disk_orders, order_disks
 
 ND = "N/D"
 NON_FILESYSTEM_TYPES = frozenset({"crypto_LUKS", "LVM2_member", "linux_raid_member", "swap"})
@@ -26,7 +30,10 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _ATA_TEMP_ATTRIBUTES = {"Temperature_Celsius", "Airflow_Temperature_Cel", "Temperature_Internal"}
 _SIMPLE_TEMP = re.compile(r"(?:Temperature|Current Drive Temperature):\s*(\d+)\b")
 
-LSBLK_COLUMNS = "NAME,TYPE,SIZE,MODEL,TRAN,MOUNTPOINTS,ROTA,FSTYPE,MAJ:MIN,LABEL,WWN,SERIAL,DISKSEQ"
+LSBLK_COLUMNS = ("NAME,TYPE,SIZE,MODEL,TRAN,MOUNTPOINTS,ROTA,FSTYPE,MAJ:MIN,LABEL,WWN,SERIAL,DISK-SEQ,"
+                 "KNAME,START,LOG-SEC,PKNAME,PARTUUID,PARTTYPE,PTTYPE,PARTN,UUID,SUBSYSTEMS")
+OPTIONAL_COLUMNS = frozenset({"WWN", "SERIAL", "DISK-SEQ", "KNAME", "START", "LOG-SEC",
+                              "PKNAME", "PARTUUID", "PARTTYPE", "PTTYPE", "PARTN", "UUID", "SUBSYSTEMS"})
 # util-linux < 2.37 has no MOUNTPOINTS column.
 LSBLK_COLUMNS_LEGACY = LSBLK_COLUMNS.replace("MOUNTPOINTS", "MOUNTPOINT")
 
@@ -55,6 +62,8 @@ class DiskMetrics:
     partitions: list = field(default_factory=list)
     temperature_source: Optional[str] = None
     direct_filesystem: Optional[PartitionMetrics] = None
+    layout: Optional[PhysicalLayout] = None
+    order: DiskOrder = DiskOrder()
 
 
 def _truthy(value) -> bool:
@@ -109,6 +118,8 @@ class StorageMonitor:
         self._unverified_retries = {}
         self.thermal_generations = {}
         self._lsblk_columns = None
+        self._btrfs_members = {}
+        self._layout_cache = {}
 
     # ---- topology -------------------------------------------------------
 
@@ -144,17 +155,10 @@ class StorageMonitor:
         except OSError:
             names = []
         before = {name: diskseq(name) for name in names}
-        basic = LSBLK_COLUMNS.rsplit(',WWN', 1)[0]
-        without_seq = LSBLK_COLUMNS.rsplit(',DISKSEQ', 1)[0]
-        variants = [LSBLK_COLUMNS, LSBLK_COLUMNS_LEGACY, without_seq,
-                    without_seq.replace('MOUNTPOINTS', 'MOUNTPOINT'), basic,
-                    basic.replace('MOUNTPOINTS', 'MOUNTPOINT')]
-        if self._lsblk_columns:
-            variants.insert(0, self._lsblk_columns)
-        unsupported = set()
-        for columns in dict.fromkeys(variants):
-            if unsupported.intersection(columns.split(',')):
-                continue
+        columns = self._lsblk_columns or LSBLK_COLUMNS
+        # Drop only explicitly unsupported optional fields, remembering the
+        # successful set. No capability subprocess or query per partition.
+        for _ in range(len(OPTIONAL_COLUMNS) + 2):
             try:
                 result = subprocess.run(
                     [self._lsblk, "-J", "-b", "-o", columns],
@@ -171,17 +175,66 @@ class StorageMonitor:
                     self.errors.pop("topology", None)
                     self._lsblk_columns = columns
                     for device in devices:
+                        if 'disk-seq' in device:
+                            device['diskseq'] = device['disk-seq']
                         name = device['name']
                         value = diskseq(name)
                         if value is not None and before.get(name) == value:
                             device['_observed_diskseq'] = value
                 return devices
             self.errors["topology"] = command_error("lsblk", result=result)
-            if not any(column in getattr(result, 'stderr', '') for column in ('MOUNTPOINTS', 'WWN', 'SERIAL', 'DISKSEQ')):
+            stderr = getattr(result, 'stderr', '') or ''
+            unsupported = {column for column in OPTIONAL_COLUMNS | {'MOUNTPOINTS'}
+                           if re.search(r'(?<![A-Z0-9_-])' + re.escape(column) + r'(?![A-Z0-9_-])', stderr)}
+            if not unsupported:
                 break
-            unsupported.update(column for column in ('MOUNTPOINTS', 'WWN', 'SERIAL', 'DISKSEQ')
-                               if column in getattr(result, 'stderr', ''))
+            selected = columns.split(',')
+            updated = ','.join('MOUNTPOINT' if col == 'MOUNTPOINTS' and col in unsupported else col for col in selected
+                               if col not in unsupported or col == 'MOUNTPOINTS')
+            if updated == columns:
+                break
+            columns = updated
         return None
+
+    def _read_btrfs_members(self, devices):
+        """Mounted kernel membership, sampled only with a topology refresh.
+
+        UUID equality alone is insufficient (clones). Missing/degraded or changing
+        inventories are unavailable, never a guess that the visible member is sole.
+        """
+        root = self._valid_mounts.get('/')
+        if not root or root[3] != 'btrfs':
+            return {}
+        uuids = set()
+        def visit(nodes):
+            for node in nodes:
+                if self._mount_identities.get((node['name'], '/')) == root and node.get('uuid'):
+                    uuids.add(str(node['uuid']).lower())
+                visit(node.get('children') or [])
+        visit(devices)
+        result = {}
+        for uuid in uuids:
+            if not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', uuid):
+                result[uuid] = BtrfsMembers(reason='UUID Btrfs no válido')
+                continue
+            base = Path(self._sys) / 'fs/btrfs' / uuid
+            try:
+                def inventory():
+                    entries = sorted((base / 'devices').iterdir())
+                    ids = sorted(p.name for p in (base / 'devinfo').iterdir())
+                    if not entries or len(entries) != len(ids) or any(not value.isdigit() for value in ids):
+                        raise ValueError('Inventario Btrfs incompleto o degradado')
+                    numbers = [device_number((path / 'dev').read_text(encoding='utf-8').strip()) for path in entries]
+                    if None in numbers or len(set(numbers)) != len(numbers):
+                        raise ValueError('Dispositivos Btrfs no verificables')
+                    return tuple(p.name for p in entries), tuple(ids), frozenset(numbers)
+                before = inventory()
+                if inventory() != before:
+                    raise ValueError('El inventario Btrfs cambió durante la lectura')
+                result[uuid] = BtrfsMembers(before[2])
+            except (OSError, ValueError) as exc:
+                result[uuid] = BtrfsMembers(reason=f'Miembros Btrfs: {exc}')
+        return result
 
     @staticmethod
     def _kind(device: dict) -> str:
@@ -647,6 +700,7 @@ class StorageMonitor:
 
     def build_metrics(self, devices: list) -> list:
         self._prepare_devices(devices)
+        physical_counts = Counter(d['name'] for d in devices if d.get('type') == 'disk')
         disks = []
         for d in devices:
             name = str(d.get("name") or "")
@@ -658,6 +712,14 @@ class StorageMonitor:
                 bool(fstype and fstype != ND)
                 or any(path.startswith("/") for path in self._mountpoints(d))
             )
+            presence = self._bindings.get(name)
+            layout_presence = presence if physical_counts[name] == 1 else None
+            topology = self.sources.get('topology', SourceState())
+            layout_key = (layout_presence, topology)
+            cached = self._layout_cache.get(name)
+            if cached is None or cached[0] is not d or cached[1] != layout_key:
+                cached = (d, layout_key, build_layout(d, layout_presence, topology))
+                self._layout_cache[name] = cached
             disks.append(DiskMetrics(
                 name=name or ND,
                 model=str(d.get("model") or ND).strip() or ND,
@@ -668,8 +730,20 @@ class StorageMonitor:
                 partitions=list(self._flatten(d.get("children"))),
                 temperature_source=self._temperature_sources.get(name),
                 direct_filesystem=self._partition(d, 0, direct=True) if has_filesystem else None,
+                layout=cached[2],
             ))
-        return disks
+            if self._bindings.get(name) != presence:
+                layout_presence = self._bindings.get(name) if physical_counts[name] == 1 else None
+                disks[-1].layout = build_layout(d, layout_presence, topology)
+        mounts = self._valid_mounts
+        topology = self.sources.get('topology')
+        if topology and topology.stale(self._clock()):
+            mounts = {}  # Cached topology is retained, but cannot assert a current root role.
+        orders = disk_orders(devices, mounts, self._mount_identities, self._bindings, self._btrfs_members)
+        for disk in disks:
+            disk.order = orders[disk.name]
+        self._layout_cache = {name: entry for name, entry in self._layout_cache.items() if name in self._device_nodes}
+        return order_disks(disks)
 
     def get_metrics(self) -> list:
         now = self._clock()
@@ -691,6 +765,7 @@ class StorageMonitor:
                 old_identities = self._mount_identities
                 self._mount_identities = {}
                 self._bind_mounts(devices, self._valid_mounts)
+                self._btrfs_members = self._read_btrfs_members(devices)
                 for name in list(self._usage_cache):
                     if {k: v for k, v in old_identities.items() if k[0] == name} != {
                         k: v for k, v in self._mount_identities.items() if k[0] == name
