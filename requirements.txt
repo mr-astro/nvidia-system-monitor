@@ -7,7 +7,7 @@
 #
 # Optional:
 #   lm_sensors      (panel de sensores)
-#   udisks2         (stored SMART temperatures, optional system service)
-#   smartmontools   (smartctl fallback; device permissions required)
+#   udisks2         (primary ATA SMART; >= 2.10 for NVMe.Controller)
+#   smartmontools >= 7.0 (smartctl JSON health/wear; device permissions required)
 #   NVIDIA driver   (nvidia-smi for GPU telemetry)
 # Test GUI/isolation tools: xvfb-run, Xvfb, xauth, dbus-run-session.

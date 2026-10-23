@@ -1,7 +1,8 @@
 """Storage monitoring: physical disks, their partitions and filesystem usage.
 
 The block-device topology (lsblk) rarely changes, so it is cached; filesystem
-usage (statvfs) and temperatures are refreshed on every call.
+usage (statvfs) and kernel temperatures are refreshed on every call. SMART
+JSON is shared by health and fallback temperature, on its own slow cadence.
 """
 from __future__ import annotations
 
@@ -14,12 +15,13 @@ import shutil
 import subprocess
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
 from src.data.errors import SourceState, command_error, freshness
-from src.data.udisks import UDisksTemperature
+from src.data.smart import SmartMetrics, parse_smart_json
+from src.data.udisks_smart import UDisksSMART
 from src.data.identity import DeviceIdentity, Presence, probe, sequence
 from src.data.storage_layout import PhysicalLayout, build_layout
 from src.data.storage_order import BtrfsMembers, DiskOrder, device_number, disk_orders, order_disks
@@ -64,6 +66,7 @@ class DiskMetrics:
     direct_filesystem: Optional[PartitionMetrics] = None
     layout: Optional[PhysicalLayout] = None
     order: DiskOrder = DiskOrder()
+    smart: SmartMetrics = SmartMetrics()
 
 
 def _truthy(value) -> bool:
@@ -84,20 +87,25 @@ class StorageMonitor:
         mountinfo_path="/proc/self/mountinfo",
         udisks=None,
         identity_reader=None,
+        smart_interval: float = 60.0,
+        smart_access=None,
     ):
         self.timeout = timeout
         self.topology_interval = topology_interval
         self.temperature_interval = temperature_interval
         self.failure_backoff = failure_backoff
+        self.smart_interval = max(10.0, smart_interval)
         self._sys = sys_dir
         self._nvme_sysfs = nvme_sysfs or os.path.join(sys_dir, "class", "nvme")
         self._clock = clock
         self._lsblk = shutil.which("lsblk")
         self._smartctl = shutil.which("smartctl")
+        self._smart_access = smart_access or (lambda path: os.access(path, os.R_OK))
         self._topology: list = []
         self._topology_at: Optional[float] = None
         # name -> (expires_at, value)
         self._temperature_cache: dict = {}
+        self._smart_cache: dict = {}
         self.errors = {}
         self.sources = {}
         self.refresh_interval = 1.0
@@ -105,9 +113,9 @@ class StorageMonitor:
         self._mount_identities = {}
         self._usage_cache = {}
         self._valid_mounts = {}
-        self._udisks = UDisksTemperature(
+        self._udisks = UDisksSMART(
             timeout=timeout, poll_interval=temperature_interval,
-            failure_backoff=failure_backoff, clock=clock,
+            failure_backoff=failure_backoff, clock=clock, attribute_interval=self.smart_interval,
         ) if udisks is None else udisks
         self._selected_temperatures = {}
         self._temperature_sources = {}
@@ -447,45 +455,127 @@ class StorageMonitor:
         return None
 
     def _smart_temperature(self, name: str) -> Optional[float]:
-        if not self._smartctl or not _SAFE_NAME.match(name):
-            return None
+        return self._read_smartctl(name).temperature_c
+
+    def _read_smartctl(self, name: str) -> SmartMetrics:
+        """Worker-only, bounded read. Cache TTL never extends measurement age."""
+        if name in ('.', '..') or not _SAFE_NAME.fullmatch(name):
+            return SmartMetrics(state=SourceState(error="SMART: nombre de dispositivo no válido"))
         now = self._clock()
         key = "smart:" + name
-        cached = self._temperature_cache.get(name)
+        cached = self._smart_cache.get(name)
         if cached and now < cached[0]:
+            # An inactive fallback can have its published diagnostics retired.
+            # Restore them only if the fallback is needed again, keeping both
+            # the measurement timestamp and the original backoff deadline.
+            self.sources[key] = cached[1].state
+            if cached[1].state.error:
+                self.errors[key] = cached[1].state.error
+            else:
+                self.errors.pop(key, None)
             return cached[1]
-        value = None
+        reading = None
         error = None
-        try:
-            result = subprocess.run(
-                [self._smartctl, "-A", f"/dev/{name}"], capture_output=True,
-                text=True, timeout=self.timeout, check=False,
-            )
-            value = self.parse_smart_temperature(result.stdout)
-            # Bits 0–2 describe command/device/checksum errors. Higher bits
-            # describe disk health and do not invalidate temperature collection.
-            if result.returncode & 7 or (value is None and result.returncode):
-                error = command_error("smartctl " + name, result=result)
-            elif value is None and (not result.stdout.strip() or "Temperature" in result.stdout):
-                error = "smartctl " + name + ": respuesta de temperatura vacía o malformada"
-        except (OSError, subprocess.SubprocessError) as exc:
-            error = command_error("smartctl " + name, exception=exc)
-        previous = self.sources.get(key, SourceState())
-        measured = value is not None
+        if not self._smartctl:
+            error = "smartctl: utilidad no disponible; medición SMART no disponible"
+        else:
+            try:
+                if not self._smart_access('/dev/' + name):
+                    raise PermissionError('sin acceso de lectura al dispositivo; medición SMART no disponible')
+                result = subprocess.run(
+                    [self._smartctl, "-j", "-a", f"/dev/{name}"], capture_output=True,
+                    text=True, timeout=self.timeout, check=False,
+                )
+                # Open/argument failures invalidate even plausible JSON. Bit 2
+                # can accompany partial data; publish it with an explicit error.
+                if result.returncode < 0 or result.returncode & 3:
+                    error = command_error("smartctl " + name, result=result)
+                else:
+                    reading = parse_smart_json(result.stdout, result.returncode)
+                if result.returncode & 4:
+                    error = command_error("smartctl " + name, result=result)
+            except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+                error = command_error("smartctl " + name, exception=exc)
+            except ValueError as exc:
+                error = str(exc)
+        previous = cached[1] if cached else SmartMetrics(source='smartctl')
+        state = SourceState(
+            now if reading else previous.state.acquired_at,
+            self._clock() if reading else previous.state.completed_at,
+            freshness(self.smart_interval, self.timeout), error,
+        )
+        reading = replace(reading or previous, state=state)
+        self.sources[key] = state
         if error:
             self.errors[key] = error
-            if not measured:
-                value = cached[1] if cached else None
         else:
             self.errors.pop(key, None)
-        self.sources[key] = SourceState(
-            now if measured else previous.acquired_at,
-            self._clock() if measured else previous.completed_at,
-            freshness(max(self.refresh_interval, self.temperature_interval), self.timeout), error,
-        )
-        ttl = self.temperature_interval if measured else self.failure_backoff
-        self._temperature_cache[name] = (self._clock() + ttl, value)
-        return value
+        # Failures (including partial command failures) back off independently
+        # of freshness. Disk-health warnings are successful acquisitions.
+        ttl = max(self.smart_interval, self.failure_backoff) if error else self.smart_interval
+        expires = self._clock() + ttl
+        self._smart_cache[name] = (expires, reading)
+        self._temperature_cache[name] = (expires, reading.temperature_c)
+        selected = self._selected_temperatures.get(name)
+        if selected and selected[1] == key:
+            if reading.temperature_c is None:
+                self._selected_temperatures.pop(name, None)
+            else:
+                self._selected_temperatures[name] = (reading.temperature_c, key)
+        return reading
+
+    def _read_smart(self, name):
+        """Prefer a complete UDisks measurement; never blend sources or ages."""
+        primary = None
+        read = getattr(self._udisks, 'read_smart', None)
+        if callable(read):
+            result = read(name, context=self._bindings[name])
+            if isinstance(result, SmartMetrics):
+                primary = result
+                key = 'udisks:smart:' + name
+                self.sources[key] = primary.state
+                if primary.state.error:
+                    self.errors[key] = primary.state.error
+                else:
+                    self.errors.pop(key, None)
+                if primary.state.current(self._clock()):
+                    if self._temperature_sources.get(name) != 'smart:' + name:
+                        # A working primary must not advertise a permission
+                        # failure from an unused earlier smartctl attempt.
+                        self.sources.pop('smart:' + name, None)
+                        self.errors.pop('smart:' + name, None)
+                    return primary
+        fallback = self._read_smartctl(name)
+        if fallback.state.current(self._clock()) or primary is None:
+            return fallback
+        # Preserve the newest history, clearly unavailable, if neither source
+        # can supply a current measurement. Keep both diagnostics in sources.
+        if (primary.state.acquired_at is not None and
+                (fallback.state.acquired_at is None or primary.state.acquired_at >= fallback.state.acquired_at)):
+            return primary
+        return fallback
+
+    def _health(self, name):
+        """Bracket cached and new SMART health with the A2 attachment evidence."""
+        binding = self._bindings.get(name)
+        if binding is None or not binding.identity.cacheable:
+            # A physical ID alone cannot prove continuous attachment. Existing
+            # direct temperature acquisition still works without caching health.
+            return SmartMetrics(state=SourceState(error="SMART no disponible: sesión de dispositivo no verificable"))
+        before = self._identity_reader(name, self._device_nodes[name])
+        if not binding.identity.same_attachment(before):
+            reading = None
+        else:
+            reading = self._read_smart(name)
+            after = self._identity_reader(name, self._device_nodes[name])
+            if not before.same_attachment(after):
+                reading = None
+        if reading is None:
+            self._clear_thermal(name)
+            self._bindings.pop(name, None)
+            self._topology_at = None
+            return SmartMetrics(state=SourceState(error="SMART no disponible: la identidad o sesión cambió"))
+        return reading
 
     def _read_temperature(self, name: str) -> Optional[float]:
         started = self._clock()
@@ -493,8 +583,6 @@ class StorageMonitor:
             value = self._nvme_temperature(name)
             if value is not None and math.isfinite(value):
                 self.sources["temperature:" + name] = SourceState(started, self._clock(), freshness(self.refresh_interval))
-                self.sources.pop("smart:" + name, None)
-                self.errors.pop("smart:" + name, None)
                 self._temperature_sources[name] = "temperature:" + name
                 return value
         else:
@@ -506,11 +594,6 @@ class StorageMonitor:
                 self._selected_temperatures[name] = (value, key)
                 self._temperature_sources[name] = key
                 return value
-        if name.startswith("nvme"):
-            self.sources.pop("temperature:" + name, None)
-            self._temperature_sources[name] = "smart:" + name
-            return self._smart_temperature(name)
-
         sysfs_key = "temperature:" + name
         if sysfs_key in self.sources:
             old = self.sources[sysfs_key]
@@ -542,6 +625,14 @@ class StorageMonitor:
             value = self._smart_temperature(name)
             if value is not None:
                 candidates["smart:" + name] = value
+        # Health and temperature share JSON timestamps. Never associate a
+        # previously selected temperature with a newer health-only response.
+        smart_key = "smart:" + name
+        smart = self._smart_cache.get(name)
+        if smart:
+            candidates.pop(smart_key, None)
+            if smart[1].temperature_c is not None:
+                candidates[smart_key] = smart[1].temperature_c
         # Re-read states after attempts: a failure can preserve the value while
         # changing its diagnostic, and never its original acquisition time.
         candidates = [(value, key) for key, value in candidates.items()
@@ -565,10 +656,11 @@ class StorageMonitor:
         if forget and binding and self._udisks:
             self._udisks.invalidate(binding)
         self._temperature_cache.pop(name, None)
+        self._smart_cache.pop(name, None)
         self._selected_temperatures.pop(name, None)
         self._temperature_sources.pop(name, None)
         self._unverified_retries.pop(name, None)
-        for prefix in ('smart:', 'temperature:', 'udisks:'):
+        for prefix in ('smart:', 'temperature:', 'udisks:', 'udisks:smart:'):
             self.sources.pop(prefix + name, None)
             self.errors.pop(prefix + name, None)
 
@@ -606,7 +698,7 @@ class StorageMonitor:
                 updated = Presence(binding.identity.enriched(identity), binding.generation)
                 if self._udisks:
                     self._udisks.rebind(binding, updated)
-                for cache in (self._temperature_cache, self._selected_temperatures,
+                for cache in (self._temperature_cache, self._smart_cache, self._selected_temperatures,
                               self._temperature_sources, self._unverified_retries):
                     if other in cache:
                         value = cache.pop(other)
@@ -616,7 +708,7 @@ class StorageMonitor:
                             value = value.split(':', 1)[0] + ':' + name
                         cache[name] = value
                 for mapping in (self.sources, self.errors):
-                    for prefix in ('smart:', 'temperature:', 'udisks:'):
+                    for prefix in ('smart:', 'temperature:', 'udisks:', 'udisks:smart:'):
                         if prefix + other in mapping:
                             mapping[prefix + name] = mapping.pop(prefix + other)
                 bindings[name] = updated
@@ -630,7 +722,7 @@ class StorageMonitor:
         self._bindings = bindings
         self._device_nodes = nodes
         self.thermal_generations = {prefix + name: binding.generation for name, binding in bindings.items()
-                                    for prefix in ('smart:', 'temperature:', 'udisks:')}
+                                    for prefix in ('smart:', 'temperature:', 'udisks:', 'udisks:smart:')}
         if self._udisks:
             self._udisks.prepare({binding for binding in bindings.values()
                                   if binding.identity.cacheable and binding.identity.physical})
@@ -713,6 +805,17 @@ class StorageMonitor:
                 or any(path.startswith("/") for path in self._mountpoints(d))
             )
             presence = self._bindings.get(name)
+            temperature = self._temperature(name)
+            smart = self._health(name)
+            if (presence and presence.identity.cacheable
+                    and self._temperature_sources.get(name) == "smart:" + name
+                    and temperature != self._smart_cache.get(name, (None, SmartMetrics()))[1].temperature_c):
+                # A health refresh can replace/remove the selected fallback
+                # while UDisks remains valid. Re-select from the updated cache.
+                temperature = self._temperature(name)
+            if self._bindings.get(name) != presence:
+                temperature = None
+                smart = SmartMetrics(state=SourceState(error="SMART no disponible: la identidad o sesión cambió"))
             layout_presence = presence if physical_counts[name] == 1 else None
             topology = self.sources.get('topology', SourceState())
             layout_key = (layout_presence, topology)
@@ -726,11 +829,12 @@ class StorageMonitor:
                 kind=self._kind(d),
                 transport=str(d.get("tran") or ND).upper(),
                 size_bytes=d.get("size"),
-                temperature_c=self._temperature(name),
+                temperature_c=temperature,
                 partitions=list(self._flatten(d.get("children"))),
                 temperature_source=self._temperature_sources.get(name),
                 direct_filesystem=self._partition(d, 0, direct=True) if has_filesystem else None,
                 layout=cached[2],
+                smart=smart,
             ))
             if self._bindings.get(name) != presence:
                 layout_presence = self._bindings.get(name) if physical_counts[name] == 1 else None
@@ -782,7 +886,8 @@ class StorageMonitor:
         disks = self.build_metrics(self._topology)
         active = {"topology"}
         for disk in disks:
-            active.update(("temperature:" + disk.name, "smart:" + disk.name, "udisks:" + disk.name))
+            active.update(("temperature:" + disk.name, "smart:" + disk.name, "udisks:" + disk.name,
+                           "udisks:smart:" + disk.name))
             active.update("usage:" + p.name for p in disk.partitions)
             if disk.direct_filesystem is not None:
                 active.add("usage:" + disk.direct_filesystem.name)

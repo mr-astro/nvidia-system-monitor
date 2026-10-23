@@ -10,6 +10,7 @@ from unittest import mock
 
 from src.data.identity import DeviceIdentity, probe, sequence
 from src.data.storage import StorageMonitor
+from tests.smart_fixtures import smart_json
 from src.data.udisks import ATA, BLOCK, UDisksTemperature
 from src.data.collector import Collector
 from src.data.storage_presentation import StorageAliasWorker
@@ -32,7 +33,7 @@ class ThermalIdentity(unittest.TestCase):
         self.topology()
         with mock.patch('src.data.storage.shutil.which', return_value=None):
             self.monitor = StorageMonitor(clock=lambda: self.now[0], topology_interval=0,
-                                          identity_reader=self.identify, udisks=False)
+                                          identity_reader=self.identify, udisks=False, smart_interval=10, smart_access=lambda path: True)
         self.monitor._smartctl = '/synthetic/smartctl'
         self.monitor._read_mountinfo = mock.Mock(return_value={})
         self.monitor._run_lsblk = mock.Mock(side_effect=lambda: copy.deepcopy(self.nodes))
@@ -55,7 +56,7 @@ class ThermalIdentity(unittest.TestCase):
 
     def smart(self, args, **kwargs):
         name = args[-1].rsplit('/', 1)[-1]
-        return SimpleNamespace(returncode=0, stdout=f'Temperature: {self.values[name]} Celsius\n', stderr='')
+        return SimpleNamespace(returncode=0, stdout=smart_json(temperature=self.values[name]), stderr='')
 
     def metrics(self):
         return {disk.name: disk for disk in self.monitor.get_metrics()}
@@ -273,7 +274,7 @@ class ThermalIdentity(unittest.TestCase):
     def test_changed_identity_during_smart_discards_value_and_all_old_state(self):
         def racing(args, **kwargs):
             self.live['sda'] = identity('B', 2)
-            return SimpleNamespace(returncode=0, stdout='Temperature: 38 Celsius\n', stderr='')
+            return SimpleNamespace(returncode=0, stdout=smart_json(), stderr='')
         self.run.side_effect = racing
         self.assertIsNone(self.metrics()['sda'].temperature_c)
         self.assertNotIn('sda', self.monitor._temperature_cache)
@@ -308,6 +309,7 @@ class ThermalIdentity(unittest.TestCase):
             result = self.smart(args, **kwargs)
             if args[-1].endswith('sdb'):
                 result.returncode = 4; result.stderr = 'synthetic checksum'
+                result.stdout = smart_json(temperature=42, exit_status=4)
             return result
         self.run.side_effect = read
         self.metrics()
@@ -327,7 +329,7 @@ class ThermalIdentity(unittest.TestCase):
         self.assertEqual(round(self.metrics()['sda'].temperature_c), 65)
         self.assertNotIn(old, provider._samples)
         self.assertEqual(self.fetch.call_count, 2)
-        self.run.assert_not_called()
+        self.assertEqual(self.run.call_count, 2)  # Health is independent of UDisks temperature.
 
     def test_udisks_daemon_still_reporting_old_association_is_rejected(self):
         provider = self.udisks()
@@ -348,7 +350,7 @@ class ThermalIdentity(unittest.TestCase):
         self.assertEqual(self.monitor.sources['udisks:sdb'].age(111), 307)
         self.assertEqual(self.monitor._bindings['sdb'], context)
         self.assertEqual(len(provider._samples), 1)
-        self.run.assert_not_called()
+        self.assertEqual(self.run.call_count, 2)  # Separate health cadence, including the rename.
 
     def test_udisks_changed_identity_during_fetch_cannot_publish_old_value(self):
         self.udisks(); fetch = self.fetch.side_effect
@@ -410,7 +412,7 @@ class ThermalIdentity(unittest.TestCase):
         self.assertEqual(self.fetch.call_count, 1)
         self.assertEqual(self.monitor._run_lsblk.call_count, 1)
         self.assertEqual(logger.error.call_count, 1)
-        self.run.assert_not_called()
+        self.assertEqual(self.run.call_count, 1)  # Only the identifiable device acquires health.
 
     def test_udisks_bus_backoff_on_replacement_never_inherits_previous_sample(self):
         self.udisks(); self.metrics()
@@ -430,7 +432,7 @@ class ThermalIdentity(unittest.TestCase):
     def test_smart_measurement_is_rejected_if_device_disappears_during_call(self):
         def race(args, **kwargs):
             self.live.clear()
-            return SimpleNamespace(returncode=0, stdout='Temperature: 38 Celsius\n', stderr='')
+            return SimpleNamespace(returncode=0, stdout=smart_json(), stderr='')
         self.run.side_effect = race
         self.assertIsNone(self.metrics()['sda'].temperature_c)
         self.assertFalse(self.monitor._temperature_cache)

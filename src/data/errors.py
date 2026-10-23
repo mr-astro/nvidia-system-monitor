@@ -17,6 +17,10 @@ class SourceState:
         age = self.age(now)
         return bool(self.error) or (age is not None and age > self.max_age)
 
+    def current(self, now):
+        """A missing measurement or a failed refresh cannot assert validity."""
+        return self.acquired_at is not None and not self.stale(now)
+
 
 def freshness(cadence, timeout=0.0):
     """One scheduled interval plus bounded collection and scheduling tolerance."""

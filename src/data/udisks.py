@@ -16,6 +16,8 @@ from src.data.identity import identifier, wwn
 
 BLOCK = "org.freedesktop.UDisks2.Block"
 ATA = "org.freedesktop.UDisks2.Drive.Ata"
+NVME = "org.freedesktop.UDisks2.NVMe.Controller"
+DRIVE = "org.freedesktop.UDisks2.Drive"
 SERVICE = "org.freedesktop.UDisks2"
 ROOT = "/org/freedesktop/UDisks2"
 _NAME = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -67,26 +69,53 @@ class UDisksTemperature:
             self._contexts.add(new)
 
     @staticmethod
+    def _model_matches(block, expected, actual):
+        if expected == actual:
+            return True
+        # Linux's SCSI model field is 16 bytes; ATA IDENTIFY/UDisks may expose
+        # the full model. Only recognise this exact, directional truncation on
+        # a whole sd disk. It never supplies physical evidence by itself.
+        if not expected.isascii() or len(expected) != 16 or not actual.startswith(expected):
+            return False
+        raw = block.get('Device')
+        if not isinstance(raw, (bytes, bytearray, list, tuple)):
+            return False
+        try:
+            device = bytes(raw).rstrip(b'\0')
+        except (ValueError, TypeError):
+            return False
+        return re.fullmatch(rb'/dev/sd[a-z]+', device) is not None
+
+    @staticmethod
     def _matches(block, drive, context):
         expected = context.identity
         checks = []
         actual_wwn = wwn(drive.get('WWN'))
         actual_serial = identifier(drive.get('Serial'))
+        actual_model = identifier(drive.get('Model'))
         if expected.wwn and actual_wwn:
             checks.append(expected.wwn == actual_wwn)
         if expected.serial and actual_serial:
             checks.append(expected.serial == actual_serial)
+        if expected.model and actual_model:
+            # Model alone is not physical evidence; it can only contradict a
+            # corroborated WWN/serial, never establish a match by itself.
+            if not UDisksTemperature._model_matches(block, expected.model, actual_model):
+                return False
         block_id = block.get('Id', '')
         if expected.wwn and isinstance(block_id, str) and block_id.startswith('by-id-wwn-'):
             checks.append(expected.wwn == wwn(block_id.removeprefix('by-id-')))
         return bool(checks) and all(checks)
 
-    def _managed_objects(self):
+    def _call(self, path, interface, method, parameters, signature):
         # Lazy import keeps this optional source usable without GUI imports.
         from gi.repository import Gio, GLib
 
         cancel = Gio.Cancellable()
-        timer = threading.Timer(self.timeout, cancel.cancel)
+        budget = min(self.timeout, getattr(self, '_deadline', float('inf')) - time.monotonic())
+        if budget <= 0:
+            raise TimeoutError("tiempo límite de lectura SMART D-Bus")
+        timer = threading.Timer(budget, cancel.cancel)
         timer.daemon = True
         started = time.monotonic()
         timer.start()
@@ -98,17 +127,31 @@ class UDisksTemperature:
                     | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, cancel,
                 )
                 self._connection.set_exit_on_close(False)
-            remaining = self.timeout - (time.monotonic() - started)
+            remaining = budget - (time.monotonic() - started)
             if remaining <= 0:
                 raise TimeoutError("tiempo límite de conexión D-Bus")
             response = self._connection.call_sync(
-                SERVICE, ROOT, "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
-                None, GLib.VariantType.new("(a{oa{sa{sv}}})"),
+                SERVICE, path, interface, method,
+                parameters, GLib.VariantType.new(signature),
                 Gio.DBusCallFlags.NO_AUTO_START, max(1, int(remaining * 1000)), cancel,
             )
             return response.unpack()[0]
         finally:
             timer.cancel()
+
+    def _managed_objects(self):
+        return self._call(ROOT, "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
+                          None, "(a{oa{sa{sv}}})")
+
+    @staticmethod
+    def _validate_objects(objects):
+        if not isinstance(objects, dict) or any(
+            not isinstance(path, str) or not isinstance(interfaces, dict)
+            or any(not isinstance(properties, dict) for properties in interfaces.values())
+            for path, interfaces in objects.items()
+        ):
+            raise ValueError("respuesta ObjectManager malformada")
+        return objects
 
     def _refresh(self):
         now = self._clock()
@@ -116,13 +159,7 @@ class UDisksTemperature:
             return
         self._refresh_requested = False
         try:
-            objects = self._fetch()
-            if not isinstance(objects, dict) or any(
-                not isinstance(path, str) or not isinstance(interfaces, dict)
-                or any(not isinstance(properties, dict) for properties in interfaces.values())
-                for path, interfaces in objects.items()
-            ):
-                raise ValueError("respuesta ObjectManager malformada")
+            objects = self._validate_objects(self._fetch())
         except Exception as exc:
             self._error = f"UDisks2: {type(exc).__name__}: {str(exc)[:400]}"
             self._next_read = self._clock() + self.failure_backoff
@@ -180,8 +217,11 @@ class UDisksTemperature:
         if previous and previous[0] != identity:
             self._samples.pop(key)
             previous = None
-        ata = self._objects.get(drive, {}).get(ATA, {})
-        if ata.get("SmartSupported") is not True or ata.get("SmartEnabled") is not True:
+        interfaces = self._objects.get(drive, {})
+        ata = interfaces.get(NVME, interfaces.get(ATA, {}))
+        if NVME in interfaces and ata.get('State') != 'live':
+            return self._unavailable(key, "UDisks2: controlador NVMe no disponible")
+        if NVME not in interfaces and (ata.get("SmartSupported") is not True or ata.get("SmartEnabled") is not True):
             return self._unavailable(key, "UDisks2: SMART no disponible o deshabilitado")
         updated, kelvin = ata.get("SmartUpdated"), ata.get("SmartTemperature")
         wall = self._wall_clock()

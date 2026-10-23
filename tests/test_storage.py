@@ -8,6 +8,7 @@ import json
 from unittest import mock
 
 from src.data.storage import StorageMonitor
+from tests.smart_fixtures import smart_json
 from src.data.errors import SourceState, freshness
 from src.data.udisks import TemperatureReading
 from src.data.identity import DeviceIdentity
@@ -44,6 +45,8 @@ SCSI = "Current Drive Temperature:     30 C\n"
 
 def fake_monitor(**kwargs):
     kwargs.setdefault("udisks", False)
+    kwargs.setdefault("smart_interval", 10)
+    kwargs.setdefault("smart_access", lambda path: True)
     kwargs.setdefault('sys_dir', '/synthetic/missing-sysfs')
     kwargs.setdefault('identity_reader', lambda name, node: DeviceIdentity(
         diskseq=sum(map(ord, name)) + 1, serial='synthetic-' + name, model='synthetic'))
@@ -215,18 +218,18 @@ class Temperature(unittest.TestCase):
 
     def _smart_monitor(self, clock):
         with mock.patch("shutil.which", side_effect=lambda n: f"/usr/bin/{n}"):
-            return StorageMonitor(temperature_interval=10, failure_backoff=300, clock=clock)
+            return StorageMonitor(temperature_interval=10, smart_interval=10, failure_backoff=300, clock=clock, smart_access=lambda path: True)
 
     def test_smartctl_output_is_parsed_even_with_nonzero_exit(self):
         m = self._smart_monitor(lambda: 0.0)
-        result = types.SimpleNamespace(returncode=4, stdout=ATA, stderr="")
+        result = types.SimpleNamespace(returncode=4, stdout=smart_json(exit_status=4), stderr="")
         with mock.patch("src.data.storage.subprocess.run", return_value=result):
             self.assertEqual(m._smart_temperature("sda"), 38.0)
 
     def test_smartctl_success_is_cached_for_interval(self):
         now = [0.0]
         m = self._smart_monitor(lambda: now[0])
-        result = types.SimpleNamespace(returncode=0, stdout=ATA, stderr="")
+        result = types.SimpleNamespace(returncode=0, stdout=smart_json(), stderr="")
         with mock.patch("src.data.storage.subprocess.run", return_value=result) as run:
             m._smart_temperature("sda")
             now[0] = 5
@@ -659,7 +662,7 @@ class TemperatureSelection(unittest.TestCase):
             return TemperatureReading(40, SourceState(0, 0, 5))
 
         self.provider.read.side_effect = delayed
-        with mock.patch('src.data.storage.subprocess.run', return_value=types.SimpleNamespace(returncode=0, stdout=ATA)) as run:
+        with mock.patch('src.data.storage.subprocess.run', return_value=types.SimpleNamespace(returncode=0, stdout=smart_json())) as run:
             self.assertEqual(self.monitor._temperature('sda'), 38)
         run.assert_called_once()
         self.assertEqual(self.monitor._temperature_sources['sda'], 'smart:sda')
@@ -670,13 +673,13 @@ class TemperatureSelection(unittest.TestCase):
                         TemperatureReading(40, SourceState(95, 95, 752, 'bus failed'))):
             with self.subTest(reading=reading):
                 self.reading = reading
-                with mock.patch('src.data.storage.subprocess.run', return_value=types.SimpleNamespace(returncode=0, stdout=ATA)):
+                with mock.patch('src.data.storage.subprocess.run', return_value=types.SimpleNamespace(returncode=0, stdout=smart_json())):
                     self.assertEqual(self.monitor._temperature('sda'), 38)
                 self.assertEqual(self.monitor._temperature_sources['sda'], 'smart:sda')
 
     def test_valid_older_preferred_source_does_not_replace_recent_smart_then_takes_over(self):
         self.reading = TemperatureReading(None, SourceState(error='not available'))
-        with mock.patch('src.data.storage.subprocess.run', return_value=types.SimpleNamespace(returncode=0, stdout=ATA)):
+        with mock.patch('src.data.storage.subprocess.run', return_value=types.SimpleNamespace(returncode=0, stdout=smart_json())):
             self.assertEqual(self.monitor._temperature('sda'), 38)
         self.now[0] = 101
         self.reading = TemperatureReading(40, SourceState(90, 90, 752))
@@ -713,7 +716,7 @@ class TemperatureSelection(unittest.TestCase):
         self.assertEqual(self.monitor._temperature('sda'), 40)
         self.assertTrue(self.monitor.sources['udisks:sda'].stale(100))
         self.assertEqual(self.monitor.sources['udisks:sda'].age(100), 800)
-        self.assertNotIn('smart:sda', self.monitor.sources)
+        self.assertIn('no disponible', self.monitor.sources['smart:sda'].error)
 
     def test_disk_metrics_publish_selected_source_and_prune_disappeared_states(self):
         nodes = [{'name': 'sda', 'type': 'disk', 'tran': 'sata'}]
@@ -777,7 +780,7 @@ class StorageCommandFailures(unittest.TestCase):
         now = [0.0]
         monitor = fake_monitor(clock=lambda: now[0])
         monitor._smartctl = "/usr/bin/smartctl"
-        with mock.patch("src.data.storage.subprocess.run", return_value=types.SimpleNamespace(returncode=8, stdout=ATA)):
+        with mock.patch("src.data.storage.subprocess.run", return_value=types.SimpleNamespace(returncode=8, stdout=smart_json(exit_status=8))):
             self.assertEqual(monitor._smart_temperature("sda"), 38)
         self.assertEqual(monitor.sources["smart:sda"].max_age, freshness(10, 2))
         now[0] = 9
@@ -791,7 +794,7 @@ class StorageCommandFailures(unittest.TestCase):
         self.assertEqual(monitor.sources["smart:sda"].acquired_at, 0)
         self.assertTrue(monitor.sources["smart:sda"].stale(100))
         now[0] = 310
-        with mock.patch("src.data.storage.subprocess.run", return_value=types.SimpleNamespace(returncode=0, stdout=ATA)):
+        with mock.patch("src.data.storage.subprocess.run", return_value=types.SimpleNamespace(returncode=0, stdout=smart_json())):
             monitor._smart_temperature("sda")
         self.assertNotIn("smart:sda", monitor.errors)
         self.assertEqual(monitor.sources["smart:sda"].acquired_at, 310)
@@ -800,7 +803,7 @@ class StorageCommandFailures(unittest.TestCase):
         monitor = fake_monitor(clock=lambda: 5.0)
         monitor._smartctl = "/usr/bin/smartctl"
         with mock.patch("src.data.storage.subprocess.run", return_value=types.SimpleNamespace(
-            returncode=4, stdout=ATA, stderr="checksum error"
+            returncode=4, stdout=smart_json(exit_status=4), stderr="checksum error"
         )):
             self.assertEqual(monitor._smart_temperature("sda"), 38)
         self.assertIn("checksum error", monitor.errors["smart:sda"])

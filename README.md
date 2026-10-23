@@ -487,16 +487,24 @@ telemetría. El bucle de GTK lee instantáneas y actualiza los widgets existente
 - Cada fuente falla de forma aislada: si una falla, las demás siguen funcionando y el
 encabezado muestra un aviso (el detalle aparece al pasar el cursor).
 - La topología de discos (`lsblk`) se consulta cada 15 s; los sensores, cada 5 s.
-UDisks2 comparte una consulta entre discos cada 10 s y espera 300 s tras un fallo.
-`smartctl -A` se usa como alternativa y almacena una lectura de temperatura durante
-10 s por disco; sin lectura espera 300 s antes de reintentar. Una temperatura
-extraída con diagnóstico de error conserva ese diagnóstico.
+UDisks2 es la fuente SMART principal para ATA y NVMe: comparte el inventario cada
+10 s y consulta `SmartGetAttributes` cada 60 s por sesión, con timeout y backoff
+de 300 s. La edad procede de `SmartUpdated`, sin solicitar actualizaciones al disco.
+`smartctl -j -a` es la alternativa si UDisks2 no ofrece una muestra vigente y hay
+acceso de lectura al dispositivo. Conserva su intervalo de 60 s, timeout de 2 s
+y backoff de al menos 300 s; los avisos de salud y errores se registran separados.
 - La edad de una temperatura SMART directa se ancla a su adquisición; la de UDisks2,
 a `SmartUpdated`. Volver a consultar una lectura almacenada no reinicia su edad.
-El umbral SMART directo es 14,5 s con los parámetros predeterminados; el de UDisks2
+El umbral SMART directo es 77 s con los parámetros predeterminados; el de UDisks2
 es 752 s. Un error genera aviso inmediatamente; al superar el umbral, la tarjeta
 deja de mostrar la temperatura y conserva el último valor y edad en el tooltip.
 Los 300 s de reintento tras fallo no extienden la validez de la lectura anterior.
+- La salud SMART, `Percentage Used` de NVMe, horas, advertencias y contadores
+se muestran con su antigüedad. Una consulta fallida o vencida presenta SMART como
+no disponible y reserva los valores anteriores para el tooltip. `Percentage Used`
+es desgaste estimado, puede superar 100% y no equivale a espacio ocupado.
+No se deduce desgaste SATA de atributos de fabricantes. Véase [adquisición SMART](docs/storage-smart.md)
+para el modelo, validación, identidad y límites de esta fase.
 - No se ejecutan benchmarks de almacenamiento.
 
 ## Limitaciones
@@ -505,8 +513,8 @@ Los 300 s de reintento tras fallo no extienden la validez de la lectura anterior
 sensores que Linux exponga.
 - **No se muestra el consumo eléctrico de la CPU**: no existe una fuente fiable y
 universal sin privilegios, y no se presenta una estimación como si fuera una medición.
-- La temperatura NVMe se intenta leer de sysfs y, si no está disponible, de
-`smartctl`. Para SATA se intenta drivetemp, luego UDisks2 y finalmente `smartctl`.
+- La temperatura NVMe se intenta leer de sysfs, luego UDisks2 y después
+`smartctl` con acceso. Para SATA se intenta drivetemp, luego UDisks2 y finalmente `smartctl`.
 La disponibilidad depende del hardware, soporte del kernel, propiedades SMART
 del servicio y permisos de lectura. La aplicación no eleva privilegios; si no
 hay una medición disponible dentro de su umbral de edad, se muestra `N/D`.
