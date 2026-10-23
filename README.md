@@ -268,6 +268,25 @@ donas, sin cambiar la composición visual ni sumar capas lógicas. La arquitectu
 los límites de verificación y el procedimiento de validación real se describen en
 [Almacenamiento: fase 2A](docs/storage-topology.md).
 
+La fase 2B presenta esa distribución mediante donas persistentes y leyendas
+textuales adaptables, separadas del uso de filesystem. Los datos físicos obsoletos
+o no verificables muestran un estado neutro. Véanse la arquitectura y la validación
+visual en [Almacenamiento: fase 2B](docs/storage-chart.md).
+
+El refinamiento 2B.1 añade un anillo interior para una lectura de filesystem
+identificada, sin presentarla como utilización global del disco. Se prioriza el
+filesystem montado en `/`, con su porcentaje destacado. En los demás discos se
+elige el único filesystem montado y medible; varios medibles sin `/` dejan el
+interior neutro y sus porcentajes siguen en los detalles. Una raíz obsoleta o con
+error no se sustituye por otro montaje.
+La fase 2B.2 añade niveles textuales y colores dinámicos solo al anillo interior:
+Normal por debajo de 70%, Atención desde 70% y Crítico desde 85%, con estado
+Desconocido si no hay una lectura vigente. La configuración específica
+`storage_usage` permite ajustar esos niveles y colores conservando los ajustes
+generales de barras y la paleta física.
+La tarjeta compacta mantiene la leyenda completa y las cifras técnicas en el
+desplegable, con los diagnósticos importantes visibles.
+
 La cabecera indica cuándo se recibió la última instantánea y nombra las fuentes
 con avisos. Las temperaturas SMART y UDisks2 muestran su antigüedad en la tarjeta
 del disco; una lectura almacenada no hace parecer antiguas las demás métricas.
@@ -281,14 +300,16 @@ montajes se conservan en la información secundaria; no se infieren nombres
 por el formato o el punto de montaje. Esto no modifica las etiquetas reales ni
 las reglas de validación de montajes y caducidad.
 
-La barra de cabecera muestra **el uso del sistema de archivos identificado**, no
+Las barras del desplegable muestran **el uso del sistema de archivos identificado**, no
 la ocupación física del disco: porcentaje, espacio usado y espacio disponible
 según `statvfs` (porcentaje = usado / (usado + disponible)). Si existen varios
-sistemas de archivos independientes, la cabecera indica «Uso por particiones»
+sistemas de archivos independientes, el resumen técnico indica «Uso por particiones»
 y sus barras aparecen al desplegar. Los montajes compartidos de btrfs se muestran
 una sola vez, sin sumar subvolúmenes. Sin montaje o medición aparece «Uso no
-disponible»; un fallo temporal conserva el último uso con aviso y antigüedad,
-mientras que un cambio de identidad del montaje lo invalida inmediatamente.
+disponible»; las barras pueden conservar el último uso con aviso y antigüedad
+ante un fallo temporal, mientras que un cambio de identidad del montaje lo
+invalida inmediatamente. El anillo interior aplica la prioridad de `/` descrita
+arriba y queda neutro si la lectura seleccionada está obsoleta o tiene error.
 
 Para temperatura SATA, el código de esta rama prueba sysfs/drivetemp, después las propiedades
 almacenadas de UDisks2 en el bus D-Bus del sistema y, si es necesario, `smartctl`.
@@ -313,6 +334,15 @@ válida de otra fuente.
 | `panels.sensors` | `false` | Panel de sensores de `lm_sensors`. |
 | `color_scheme.low/medium/high_usage_color` | verde / naranja / rojo | Colores de las barras de uso, en formato `#RRGGBB`. |
 | `thresholds.medium_percent / high_percent` | `60` / `85` | Porcentajes a partir de los cuales la barra cambia de color. |
+| `storage_usage.thresholds.medium_percent / high_percent` | `70` / `85` | Umbrales propios del anillo interior. |
+| `storage_usage.color_scheme.low/medium/high_usage_color` | `#76B900` / `#E5A93D` / `#E65B57` | Colores Normal / Atención / Crítico del anillo interior. |
+
+Para el interior se aplican sus valores predeterminados, luego los valores
+generales válidos presentes explícitamente en el JSON y, finalmente, los valores
+válidos de `storage_usage`. Así se respetan configuraciones anteriores sin
+cambiar las barras generales ni el exterior. Un valor explícito igual al antiguo
+predeterminado también se respeta. El ejemplo incluye `storage_usage` con el nuevo
+perfil completo; las configuraciones existentes no se reescriben automáticamente.
 
 Cada canal utiliza un logger y handlers propios, sin propagar mensajes al logger
 raíz. Su `monitor.log` es rotativo: 512 KiB más dos archivos de respaldo. Si no

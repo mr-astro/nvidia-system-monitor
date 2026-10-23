@@ -35,6 +35,14 @@ DEFAULT_CONFIG = {
         "medium_percent": 60,
         "high_percent": 85,
     },
+    "storage_usage": {
+        "thresholds": {"medium_percent": 70, "high_percent": 85},
+        "color_scheme": {
+            "low_usage_color": "#76B900",
+            "medium_usage_color": "#E5A93D",
+            "high_usage_color": "#E65B57",
+        },
+    },
 }
 
 MIN_INTERVAL = 0.5
@@ -48,6 +56,22 @@ def _number(value, default: float, lo: float, hi: float) -> float:
     if value != value:  # NaN
         return default
     return min(max(float(value), lo), hi)
+
+
+def _apply_usage_settings(target, data):
+    """Validate the same keys for global bars and the scoped inner-ring policy."""
+    colors = data.get("color_scheme")
+    if isinstance(colors, dict):
+        for key in target["color_scheme"]:
+            value = colors.get(key)
+            if isinstance(value, str) and _HEX_COLOR.match(value):
+                target["color_scheme"][key] = value
+    thresholds = data.get("thresholds")
+    if isinstance(thresholds, dict):
+        medium = _number(thresholds.get("medium_percent"), -1, 0, 100)
+        high = _number(thresholds.get("high_percent"), -1, 0, 100)
+        if 0 <= medium < high <= 100:
+            target["thresholds"] = {"medium_percent": medium, "high_percent": high}
 
 
 def sanitize(data: dict) -> dict:
@@ -78,19 +102,13 @@ def sanitize(data: dict) -> dict:
             if isinstance(panels.get(key), bool):
                 out["panels"][key] = panels[key]
 
-    colors = data.get("color_scheme")
-    if isinstance(colors, dict):
-        for key in out["color_scheme"]:
-            value = colors.get(key)
-            if isinstance(value, str) and _HEX_COLOR.match(value):
-                out["color_scheme"][key] = value
-
-    thresholds = data.get("thresholds")
-    if isinstance(thresholds, dict):
-        medium = _number(thresholds.get("medium_percent"), -1, 0, 100)
-        high = _number(thresholds.get("high_percent"), -1, 0, 100)
-        if 0 <= medium < high <= 100:
-            out["thresholds"] = {"medium_percent": medium, "high_percent": high}
+    _apply_usage_settings(out, data)
+    # Only explicitly supplied, valid global preferences override ring defaults.
+    # Scoped preferences then win, without changing bars or the physical palette.
+    _apply_usage_settings(out["storage_usage"], data)
+    storage = data.get("storage_usage")
+    if isinstance(storage, dict):
+        _apply_usage_settings(out["storage_usage"], storage)
 
     return out
 

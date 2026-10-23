@@ -198,6 +198,30 @@ class GuiSmoke(unittest.TestCase):
         # Regression: the interval was once dropped when building the Collector.
         self.assertEqual(self._app(refresh_interval_seconds=2.5).collector.interval, 2.5)
 
+    def test_scoped_inner_policy_reaches_cards_and_legacy_preferences_are_inherited(self):
+        for scoped, expected_level in (({'thresholds': {'medium_percent': 80, 'high_percent': 95},
+                                        'color_scheme': {'low_usage_color': '#123456'}}, 'low'),
+                                       (None, 'medium')):
+            options = {'thresholds': {'medium_percent': 50, 'high_percent': 85},
+                       'color_scheme': {'low_usage_color': '#123456'}}
+            if scoped is not None:
+                options['storage_usage'] = scoped
+            app = self._app(**options)
+            snap = full_snapshot()
+            snap.sources['usage:nvme0n1p2'] = SourceState(10, 11, 20)
+            with mock.patch('src.gui.app.time.monotonic', return_value=11):
+                app._render(snap)
+            app.stack.set_visible_child_name('storage')
+            self._resize(app, 380)
+            card = next(iter(app.cards['storage'].disk_cards.values()))
+            self.assertEqual(card.donut.usage_style.level, expected_level)
+            self.assertEqual(app.medium, 50)
+            self.assertEqual(card.donut.usage_thresholds['medium_percent'], 80 if scoped else 50)
+            if scoped:
+                rgb = card.donut._usage_arcs[0][2]
+                for actual, wanted in zip(rgb, (0x12 / 255, 0x34 / 255, 0x56 / 255)):
+                    self.assertAlmostEqual(actual, wanted, places=5)
+
     def test_sensors_panel_is_off_by_default_and_opt_in(self):
         self.assertNotIn("sensors", self._app().cards)
         app = self._app(panels={"sensors": True})
@@ -519,7 +543,7 @@ class GuiSmoke(unittest.TestCase):
         self.assertIn('Permission denied', app.status.get_tooltip_text())
         self.assertNotIn('Permission denied', app.status.get_label())
 
-    def test_expanded_details_and_horizontal_disk_summary_fit_narrow_windows_in_both_themes(self):
+    def test_expanded_details_and_reflowing_disk_summary_fit_narrow_windows_in_both_themes(self):
         for theme in ('dark', 'system'):
             with self.subTest(theme=theme):
                 app = self._app(theme=theme)
@@ -543,8 +567,46 @@ class GuiSmoke(unittest.TestCase):
                             self.assertLessEqual(card.measure(Gtk.Orientation.HORIZONTAL, -1)[0], card.get_width())
                 left = self._bounds(disk.capacity_box, disk.overview)
                 right = self._bounds(disk.summary, disk.overview)
-                self.assertGreaterEqual(right.get_x(), left.get_x() + left.get_width())
+                self.assertGreaterEqual(right.get_y(), left.get_y() + left.get_height())
                 self.assertLessEqual(right.get_x() + right.get_width(), disk.overview.get_width() + 1)
+
+    def test_physical_donuts_keep_widgets_across_tabs_widths_and_both_themes(self):
+        from gi.repository import Pango
+        from tests.test_storage_chart_model import layout_for
+        from tests.storage_fixtures import disk, part
+        for theme in ('dark', 'system'):
+            with self.subTest(theme=theme):
+                app = self._app(theme=theme)
+                snap = full_snapshot()
+                node = disk('nvme0n1', '259:0', children=[part('nvme0n1p1', parent='nvme0n1',
+                            start=10, sectors=300, partuuid='synthetic-layout')])
+                snap.disks[0].layout = layout_for(node)
+                with mock.patch('src.gui.app.time.monotonic', return_value=11):
+                    app._render(snap)
+                card = next(iter(app.cards['storage'].disk_cards.values()))
+                area = card.donut.area
+                card.expander.set_expanded(True)
+                for width in (960, 380, 960):
+                    app.stack.set_visible_child_name('storage')
+                    self._resize(app, width)
+                    left = self._bounds(card.capacity_box, card.overview)
+                    right = self._bounds(card.summary, card.overview)
+                    if width == 380:
+                        self.assertGreaterEqual(right.get_y(), left.get_y() + left.get_height())
+                    else:
+                        self.assertGreaterEqual(right.get_x(), left.get_x() + left.get_width())
+                    for box, swatch, text in card.donut.rows.values():
+                        self.assertTrue(text.get_wrap())
+                        self.assertEqual(text.get_ellipsize(), Pango.EllipsizeMode.NONE)
+                    self.assertIs(card.donut.area, area)
+                    self.assertIsNone(card.donut._render_error)
+                    self.assertTrue(card.expander.get_expanded())
+                    app.stack.set_visible_child_name('performance')
+                    self._resize(app, width)
+                    snap.sequence += 1
+                    with mock.patch('src.gui.app.time.monotonic', return_value=12):
+                        app._render(snap)
+                self.assertEqual(app._last_render_error, {})
 
     def test_one_enabled_column_uses_the_available_width_and_no_panels_still_fits(self):
         for enabled in ('cpu', 'storage', None):

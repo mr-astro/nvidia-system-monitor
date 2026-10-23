@@ -21,5 +21,14 @@
   "thresholds": {
     "medium_percent": 60,
     "high_percent": 85
+  },
+
+  "storage_usage": {
+    "thresholds": {"medium_percent": 70, "high_percent": 85},
+    "color_scheme": {
+      "low_usage_color": "#76B900",
+      "medium_usage_color": "#E5A93D",
+      "high_usage_color": "#E65B57"
+    }
   }
 }

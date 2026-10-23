@@ -148,7 +148,7 @@ class StorageGui(unittest.TestCase):
         self.assertTrue(original['sdb'].expander.get_expanded())
         self.assertIs(next(iter(original['sdb'].partition_rows.values())), row)
 
-    def test_collapsed_card_keeps_capacity_temperature_mount_summary_and_usage_outside_details(self):
+    def test_collapsed_card_keeps_double_ring_scope_and_diagnostics_with_technical_usage_in_details(self):
         from gi.repository import Gtk
         part = PartitionMetrics('sda1', fstype='ext4', mountpoints=['/data'],
                                 used_bytes=60, free_bytes=20, usage_percent=75)
@@ -159,14 +159,17 @@ class StorageGui(unittest.TestCase):
         card = self.card('sda')
         self.assertFalse(card.expander.get_expanded())
         for widget in (card.title, card.capacity, card.temperature, card.partition_summary,
-                       card.usage, card.usage_bar, card.status):
+                       card.donut.usage_scope, card.donut.usage_values, card.status):
             self.assertIsNone(widget.get_ancestor(Gtk.Expander))
             self.assertTrue(widget.get_visible())
+        self.assertIs(card.usage_bar.get_parent(), card.partitions_box)
+        self.assertIs(card.expander.get_child(), card.partitions_box)
+        self.assertEqual(card.donut.usage_model.fraction, .75)
         self.assertIn('38,0 °C', card.temperature.get_label())
         self.assertEqual(card.partition_summary.get_label(), '1 volumen · 1 montado')
         self.assertIn('/data', card.partition_summary.get_tooltip_text())
         self.assertEqual(card.overview.get_orientation(), Gtk.Orientation.HORIZONTAL)
-        self.assertIs(card.summary.get_parent(), card.overview)
+        self.assertIs(card.summary.get_parent().get_parent(), card.overview)
         card.expander.set_expanded(True)
         self.assertIs(card.technical.get_ancestor(Gtk.Expander), card.expander)
         card.expander.set_expanded(False)
@@ -352,7 +355,8 @@ class StorageGui(unittest.TestCase):
         self.assertNotIn('technical detail', card.status.get_label())
         self.assertIn(message, card.status.get_tooltip_text())
         from gi.repository import Gtk, Pango
-        self.assertEqual(card.title.get_ellipsize(), Pango.EllipsizeMode.END)
+        self.assertEqual(card.title.get_ellipsize(), Pango.EllipsizeMode.NONE)
+        self.assertTrue(card.title.get_wrap())
         self.assertLess(card.measure(Gtk.Orientation.HORIZONTAL, -1)[0], 300)
 
     def test_no_repeated_normal_age_rows_and_stale_usage_is_explicit(self):

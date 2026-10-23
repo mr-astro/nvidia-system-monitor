@@ -75,6 +75,10 @@ progressbar.hw-bar trough, progressbar.hw-bar progress {{ min-height: 6px; borde
 progressbar.usage-low progress {{ background-image: none; background-color: {low}; }}
 progressbar.usage-medium progress {{ background-image: none; background-color: {medium}; }}
 progressbar.usage-high progress {{ background-image: none; background-color: {high}; }}
+.storage-color-0, .monitor-window .storage-swatch.storage-color-0 {{ color: {low}; }}
+.storage-inner-low, .monitor-window .storage-swatch.storage-inner-low {{ color: {inner_low}; }}
+.storage-inner-medium, .monitor-window .storage-swatch.storage-inner-medium {{ color: {inner_medium}; }}
+.storage-inner-high, .monitor-window .storage-swatch.storage-inner-high {{ color: {inner_high}; }}
 """
 
 # Neutral card used with the system theme (works on light and dark).
@@ -111,11 +115,15 @@ _DARK_CSS = """
 """
 
 
-def build_css(colors: dict, dark: bool = True) -> str:
+def build_css(colors: dict, dark: bool = True, *, storage_colors=None) -> str:
+    storage_colors = colors if storage_colors is None else storage_colors
     base = _BASE_CSS.format(
         low=colors["low_usage_color"],
         medium=colors["medium_usage_color"],
         high=colors["high_usage_color"],
+        inner_low=storage_colors["low_usage_color"],
+        inner_medium=storage_colors["medium_usage_color"],
+        inner_high=storage_colors["high_usage_color"],
     )
     return base + (_DARK_CSS if dark else _SYSTEM_CSS) + STORAGE_CSS
 
@@ -197,7 +205,8 @@ class SystemMonitorApp(Gtk.Application):
 
     def _install_css(self) -> None:
         provider = Gtk.CssProvider()
-        css = build_css(self.config.get("color_scheme"), self.dark)
+        css = build_css(self.config.get("color_scheme"), self.dark,
+                        storage_colors=self.config.get("storage_usage")["color_scheme"])
         try:
             provider.load_from_string(css)  # GTK >= 4.12
         except AttributeError:
@@ -316,7 +325,8 @@ class SystemMonitorApp(Gtk.Application):
 
     def _new_card(self, name):
         if name == "storage":
-            return StoragePanel(self.unit, self.medium, self.high)
+            return StoragePanel(self.unit, self.medium, self.high,
+                                usage_thresholds=self.config.get("storage_usage")["thresholds"])
         return MetricCard(PANEL_TITLES[name])
 
     # ---- update loop ----------------------------------------------------

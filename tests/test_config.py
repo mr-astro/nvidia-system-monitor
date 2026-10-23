@@ -67,6 +67,53 @@ class Sanitize(unittest.TestCase):
     def test_unknown_keys_are_dropped(self):
         self.assertNotIn("evil", sanitize({"evil": 1}))
 
+    def test_inner_ring_defaults_do_not_change_global_bars(self):
+        cfg = sanitize({})
+        self.assertEqual(cfg['thresholds'], {'medium_percent': 60, 'high_percent': 85})
+        self.assertEqual(cfg['color_scheme']['low_usage_color'], '#4CAF50')
+        self.assertEqual(cfg['storage_usage']['thresholds'], {'medium_percent': 70, 'high_percent': 85})
+        self.assertEqual(cfg['storage_usage']['color_scheme'], {
+            'low_usage_color': '#76B900', 'medium_usage_color': '#E5A93D', 'high_usage_color': '#E65B57'})
+
+    def test_explicit_global_preferences_are_inherited_by_inner_ring(self):
+        cfg = sanitize({'color_scheme': {'medium_usage_color': '#123456'},
+                        'thresholds': {'medium_percent': 55, 'high_percent': 90}})
+        self.assertEqual(cfg['storage_usage']['thresholds'], cfg['thresholds'])
+        self.assertEqual(cfg['storage_usage']['color_scheme']['medium_usage_color'], '#123456')
+        self.assertEqual(cfg['storage_usage']['color_scheme']['low_usage_color'], '#76B900')
+
+    def test_explicit_legacy_default_values_are_still_preferences(self):
+        cfg = sanitize({'color_scheme': {'low_usage_color': '#4CAF50'},
+                        'thresholds': {'medium_percent': 60, 'high_percent': 85}})
+        self.assertEqual(cfg['storage_usage']['thresholds']['medium_percent'], 60)
+        self.assertEqual(cfg['storage_usage']['color_scheme']['low_usage_color'], '#4CAF50')
+
+    def test_scoped_preferences_override_inheritance_without_changing_global_settings(self):
+        cfg = sanitize({'color_scheme': {'low_usage_color': '#123456'},
+                        'thresholds': {'medium_percent': 50, 'high_percent': 90},
+                        'storage_usage': {'color_scheme': {'low_usage_color': '#ABCDEF'},
+                                          'thresholds': {'medium_percent': 70, 'high_percent': 85}}})
+        self.assertEqual(cfg['storage_usage']['color_scheme']['low_usage_color'], '#ABCDEF')
+        self.assertEqual(cfg['storage_usage']['thresholds']['medium_percent'], 70)
+        self.assertEqual(cfg['color_scheme']['low_usage_color'], '#123456')
+        self.assertEqual(cfg['thresholds']['medium_percent'], 50)
+        self.assertEqual(sanitize(cfg), cfg)
+
+    def test_invalid_scoped_preferences_fall_back_to_valid_inherited_settings(self):
+        for storage in (False, 'bad', {'thresholds': {'medium_percent': 90, 'high_percent': 10},
+                                      'color_scheme': {'low_usage_color': 'invalid CSS'}}):
+            cfg = sanitize({'thresholds': {'medium_percent': 55, 'high_percent': 90},
+                            'color_scheme': {'low_usage_color': '#112233'}, 'storage_usage': storage})
+            self.assertEqual(cfg['storage_usage']['thresholds']['medium_percent'], 55)
+            self.assertEqual(cfg['storage_usage']['color_scheme']['low_usage_color'], '#112233')
+
+    def test_invalid_ring_types_nan_and_partial_thresholds_keep_defaults(self):
+        for threshold in ({'medium_percent': True, 'high_percent': 85},
+                          {'medium_percent': float('nan'), 'high_percent': 85},
+                          {'medium_percent': 70}, {'medium_percent': 85, 'high_percent': 85}):
+            cfg = sanitize({'storage_usage': {'thresholds': threshold}})
+            self.assertEqual(cfg['storage_usage'], DEFAULT_CONFIG['storage_usage'])
+
 
 class ConfigFile(unittest.TestCase):
     def _config(self, content):
