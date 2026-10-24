@@ -11,6 +11,7 @@ from gi.repository import Gtk, Pango
 
 from src.gui.widgets import MetricCard, _set_text, LEVEL_CLASSES
 from src.gui.storage_chart import PhysicalDonut, CHART_CSS
+from src.gui.storage_smart import SmartSection, SMART_CSS
 from src.gui.storage_usage_model import prepare_usage
 from src.data.storage import NON_FILESYSTEM_TYPES
 from src.utils.disk_aliases import DiskIdentity
@@ -33,7 +34,7 @@ STORAGE_CSS = """
 .storage-stale { opacity: 0.7; }
 .storage-partition progressbar trough, .storage-partition progressbar progress { min-height: 6px; }
 .storage-disk progressbar.hw-bar trough, .storage-disk progressbar.hw-bar progress { min-height: 6px; }
-""" + CHART_CSS
+""" + CHART_CSS + SMART_CSS
 
 
 def label(css=None):
@@ -61,50 +62,6 @@ def state_detail(state, now):
         return "N/D"
     prefix = "Obsoleto" if state.stale(now) else "Medido"
     return f"{prefix} · {age_text(state, now)}" + (f" · {state.error}" if state.error else "")
-
-
-def smart_text(reading, now):
-    """Current values are explicit; historical values appear only in a tooltip."""
-    health = {"passed": "sin fallo declarado", "failed": "FALLO", "unknown": "N/D"}[reading.health]
-    fields = [f"Salud SMART: {health}",
-              f"Percentage Used (desgaste NVMe): {reading.percentage_used}%" if reading.percentage_used is not None
-              else "Percentage Used: N/D",
-              f"Horas de funcionamiento: {reading.power_on_hours} h" if reading.power_on_hours is not None
-              else "Horas de funcionamiento: N/D"]
-    warnings = " · ".join(reading.warnings)
-    if reading.state.current(now):
-        text = " · ".join(fields) + " · " + age_text(reading.state, now)
-        if warnings:
-            text += " · Advertencias: " + warnings
-    else:
-        text = "SMART: medición no disponible"
-        if reading.state.acquired_at is not None:
-            text += " · lectura anterior · " + age_text(reading.state, now)
-    detail = [f"Fuente SMART: {reading.source or 'N/D'}", state_detail(reading.state, now)]
-    if reading.state.acquired_at is not None:
-        detail.append("Última lectura (anterior)" if not reading.state.current(now) else "Lectura SMART")
-        detail.extend(fields)
-        if warnings:
-            detail.append("Advertencias: " + warnings)
-        if reading.critical_warning is not None:
-            detail.append(f"Critical Warning NVMe: 0x{reading.critical_warning:02x}")
-        if reading.media_errors is not None:
-            detail.append(f"Errores de integridad de medios NVMe: {reading.media_errors}")
-        if reading.error_log_entries is not None:
-            detail.append(f"Entradas del registro de errores NVMe: {reading.error_log_entries}")
-        if reading.available_spare is not None:
-            detail.append(f"Reserva disponible NVMe: {reading.available_spare}%")
-        if reading.unsafe_shutdowns is not None:
-            detail.append(f"Apagados inseguros NVMe (contador histórico): {reading.unsafe_shutdowns}")
-        if reading.interface_crc_errors is not None:
-            detail.append(f"CRC de interfaz SATA (contador histórico): {reading.interface_crc_errors}")
-        for attribute in reading.ata_attributes:
-            detail.append(f"Atributo ATA {attribute.id}: {attribute.name} · normalizado {attribute.value}"
-                          " · sin interpretación de desgaste")
-        if reading.exit_status is not None:
-            detail.append(f"Código de salida smartctl: {reading.exit_status}")
-    detail.append("Percentage Used estima resistencia consumida; no mide espacio ocupado ni vida restante garantizada.")
-    return text, "\n".join(detail)
 
 
 def brief_error(key, message):
@@ -232,9 +189,7 @@ class DiskCard(Gtk.Box):
         self.technical = label("storage-secondary")
         self.model = label("storage-secondary")
         self.status = label("storage-status")
-        self.smart_status = label("storage-status")
-        self.smart_status.set_wrap(True)
-        self.smart_status.set_ellipsize(Pango.EllipsizeMode.NONE)
+        self.smart = SmartSection()
         self.device_summary = label("storage-main")
         self.partition_summary = label("storage-secondary")
         self.usage_scope = label("storage-secondary")
@@ -257,7 +212,7 @@ class DiskCard(Gtk.Box):
         for child in (self.partition_summary, self.status):
             self.summary.append(child)
         self.append(self.overview)
-        self.append(self.smart_status)
+        self.append(self.smart)
         self.partitions_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.partitions_box.append(self.technical)
         self.donut.legend.remove(self.donut.full_legend)
@@ -319,12 +274,7 @@ class DiskCard(Gtk.Box):
             set_label(self.usage_warning, f"Uso obsoleto · {age_text(state, now)}", state_detail(state, now))
 
     def update(self, disk, alias, snap, now, unit, medium, high):
-        smart_summary, smart_detail = smart_text(disk.smart, now)
-        set_label(self.smart_status, smart_summary, smart_detail)
-        if disk.smart.state.current(now):
-            self.smart_status.remove_css_class("storage-stale")
-        else:
-            self.smart_status.add_css_class("storage-stale")
+        self.smart.update(disk.smart, now)
         model = (disk.model or "").strip()
         has_model = bool(model and model != "N/D")
         # Alias configuration and identity remain intact; the title identifies

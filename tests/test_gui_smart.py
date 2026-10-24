@@ -29,17 +29,20 @@ class SmartGui(unittest.TestCase):
         disk = DiskMetrics('sda', smart=reading)
         snap = Snapshot(disks=[disk], sources={'smart:sda': reading.state})
         self.card.update(disk, None, snap, now, 'C', 60, 85)
-        return self.card.smart_status.get_label(), self.card.smart_status.get_tooltip_text()
+        return self.card.smart
 
     def test_current_health_wear_hours_and_age_have_separate_meanings(self):
         reading = SmartMetrics(health='passed', percentage_used=12, power_on_hours=1234,
-                               state=SourceState(90, 90, 77))
-        text, detail = self.render(reading)
-        self.assertIn('sin fallo declarado', text)
-        self.assertIn('desgaste NVMe): 12%', text)
-        self.assertIn('1234 h', text)
-        self.assertIn('hace 10 s', text)
-        self.assertIn('no mide espacio ocupado', detail)
+                               state=SourceState(90, 90, 77), source='udisks2-nvme')
+        section = self.render(reading)
+        self.assertEqual(section.status.get_label(), 'Vigente')
+        self.assertEqual(section.values['health'].get_label(), 'Sin fallo declarado')
+        self.assertEqual(section.values['wear'].get_label(), '12%')
+        self.assertEqual(section.values['hours'].get_label(), '1234 h')
+        self.assertIn('hace 10 s', section.freshness.get_label())
+        self.assertIn('caduca en 67 s', section.freshness.get_label())
+        self.assertIn('no mide espacio ocupado', section.get_tooltip_text())
+        self.assertFalse(section.warnings_box.get_visible())
 
     def test_fedora_sata_recovery_removes_false_warnings_and_preserves_temperature(self):
         harness = test_sata_smart_regression.SataSmartRegression()
@@ -48,58 +51,67 @@ class SmartGui(unittest.TestCase):
         harness.monitor._read_smartctl('sda')
         snapshot = Collector(storage=harness.monitor, clock=lambda: harness.now[0]).collect_once()
         self.card.update(snapshot.disks[0], None, snapshot, 100, 'C', 60, 85)
+        section = self.card.smart
         self.assertIn('26,9 °C', self.card.temperature.get_label())
-        self.assertIn('2305 h', self.card.smart_status.get_label())
-        self.assertIn('131109', self.card.smart_status.get_label())
-        self.assertNotIn('no disponible', self.card.smart_status.get_label())
+        self.assertEqual(section.values['hours'].get_label(), '2305 h')
+        self.assertEqual(section.values['wear'].get_label(), 'N/D')
+        self.assertEqual(section.values['health'].get_label(), 'Sin fallo declarado')
+        self.assertIn('131109', section.warnings.get_label())
+        self.assertIn('no declara un fallo actual', section.warnings.get_label())
         self.assertNotIn('SMART: sin permisos', self.card.status.get_label())
         self.assertNotIn('SMART: error', self.card.status.get_label())
         self.assertNotIn('Error de adquisición', self.card.status.get_label())
         self.assertIn('udisks:sda', self.card.temperature.get_tooltip_text())
         self.card.update(snapshot.disks[0], None, snapshot, 853, 'C', 60, 85)
         self.assertEqual(self.card.temperature.get_label(), 'N/D')
-        self.assertIn('lectura anterior', self.card.smart_status.get_label())
+        self.assertEqual(section.status.get_label(), 'Obsoleto')
+        self.assertIn('Lectura anterior', section.freshness.get_label())
         harness.run.assert_not_called()
 
     def test_expired_or_failed_values_appear_only_as_explicit_history(self):
-        for state in (SourceState(0, 0, 77), SourceState(90, 90, 77, 'Permission denied')):
+        for state, expected in ((SourceState(0, 0, 77), 'stale'),
+                                (SourceState(90, 90, 77, 'Permission denied'), 'error')):
             with self.subTest(state=state):
-                text, detail = self.render(SmartMetrics(health='passed', percentage_used=12,
-                                                       power_on_hours=1234, state=state))
-                self.assertIn('medición no disponible', text)
-                self.assertIn('lectura anterior', text)
-                self.assertNotIn('12%', text)
-                self.assertNotIn('1234 h', text)
-                self.assertNotIn('sin fallo declarado', text)
-                self.assertIn('Última lectura (anterior)', detail)
-                self.assertIn('12%', detail)
-                self.assertTrue(self.card.smart_status.has_css_class('storage-stale'))
+                section = self.render(SmartMetrics(health='passed', percentage_used=12,
+                                                   power_on_hours=1234, state=state, source='smartctl'))
+                self.assertTrue(section.has_css_class('storage-smart-' + expected))
+                self.assertEqual([widget.get_label() for widget in section.values.values()], ['N/D'] * 3)
+                self.assertIn('Lectura anterior', section.freshness.get_label())
+                self.assertIn('Última lectura (anterior)', section.get_tooltip_text())
+                self.assertIn('12%', section.get_tooltip_text())
+                self.assertEqual(section.error.get_visible(), expected == 'error')
 
     def test_absent_fields_are_nd_and_never_zero_or_healthy(self):
-        text, _ = self.render(SmartMetrics(state=SourceState(100, 100, 77)))
-        self.assertIn('Salud SMART: N/D', text)
-        self.assertIn('Percentage Used: N/D', text)
-        self.assertIn('Horas de funcionamiento: N/D', text)
-        self.assertNotIn('0%', text)
-        text, detail = self.render(SmartMetrics(state=SourceState(error='Permission denied')))
-        self.assertEqual(text, 'SMART: medición no disponible')
-        self.assertIn('Permission denied', detail)
+        section = self.render(SmartMetrics(state=SourceState(100, 100, 77)))
+        self.assertEqual(section.status.get_label(), 'Desconocido')
+        self.assertEqual([widget.get_label() for widget in section.values.values()], ['N/D'] * 3)
+        section = self.render(SmartMetrics(state=SourceState(error='Permission denied')))
+        self.assertEqual(section.status.get_label(), 'Error de consulta')
+        self.assertEqual(section.error.get_label(), 'Permission denied')
+        self.assertTrue(section.error.get_visible())
+        self.assertFalse(section.warnings_box.get_visible())
 
     def test_warning_counters_and_recovery_update_existing_widget(self):
-        widget = self.card.smart_status
+        section = self.card.smart
+        values = dict(section.values)
         reading = SmartMetrics(health='failed', percentage_used=150, critical_warning=4,
                                media_errors=8, error_log_entries=12, warnings=('Alerta simulada',),
-                               state=SourceState(90, 90, 77), exit_status=8)
-        text, detail = self.render(reading)
-        self.assertIn('FALLO', text)
-        self.assertIn('150%', text)
-        self.assertIn('Advertencias: Alerta simulada', text)
-        self.assertIn('Errores de integridad de medios NVMe: 8', detail)
-        self.assertIn('Entradas del registro de errores NVMe: 12', detail)
+                               state=SourceState(90, 90, 77), exit_status=8, source='smartctl')
+        self.render(reading)
+        self.assertEqual(section.values['health'].get_label(), 'Fallo declarado')
+        self.assertEqual(section.values['wear'].get_label(), '150%')
+        self.assertTrue(section.values['health'].has_css_class('storage-smart-failed'))
+        self.assertEqual(section.warnings.get_label(), 'Alerta simulada')
+        self.assertTrue(section.warnings_box.get_visible())
+        self.assertIn('Errores de integridad de medios NVMe: 8', section.get_tooltip_text())
+        self.assertIn('Entradas del registro de errores NVMe: 12', section.get_tooltip_text())
         self.render(replace(reading, state=SourceState(0, 0, 77)))
-        self.render(replace(reading, state=SourceState(100, 100, 77)))
-        self.assertIs(self.card.smart_status, widget)
-        self.assertFalse(widget.has_css_class('storage-stale'))
+        self.assertFalse(section.values['health'].has_css_class('storage-smart-failed'))
+        self.render(replace(reading, health='passed', warnings=(), state=SourceState(100, 100, 77)))
+        self.assertIs(self.card.smart, section)
+        self.assertEqual(section.values, values)
+        self.assertFalse(section.has_css_class('storage-smart-stale'))
+        self.assertFalse(section.warnings_box.get_visible())
 
     def test_udisks_source_and_confirmed_counters_have_no_sata_wear_interpretation(self):
         objects, attributes, _ = three_disks()
@@ -108,17 +120,17 @@ class SmartGui(unittest.TestCase):
                 path = '/org/freedesktop/UDisks2/drives/synthetic_' + name
                 interface = ATA if name == 'sda' else NVME
                 reading = parse_properties(interface, objects[path][interface], attributes[(path, interface)])
-                text, detail = self.render(replace(reading, state=SourceState(100, 100, 752)))
+                section = self.render(replace(reading, state=SourceState(100, 100, 752)))
+                detail = section.get_tooltip_text()
                 self.assertIn('Fuente SMART: udisks2-', detail)
                 self.assertNotIn('Código de salida smartctl', detail)
                 if name == 'sda':
-                    self.assertIn('131109', text)
+                    self.assertIn('131109', section.warnings.get_label())
                     self.assertIn('Atributo ATA 231: temperature-celsius', detail)
-                    self.assertNotIn('92%', text + detail)
-                    self.assertIn('Percentage Used: N/D', text)
+                    self.assertEqual(section.values['wear'].get_label(), 'N/D')
                 else:
                     self.assertIn('Reserva disponible NVMe: 100%', detail)
-                    self.assertIn('desgaste NVMe): ' + ('7%' if name == 'nvme0n1' else '0%'), text)
+                    self.assertEqual(section.values['wear'].get_label(), '7%' if name == 'nvme0n1' else '0%')
                 if name == 'nvme0n1':
                     self.assertIn('Apagados inseguros NVMe (contador histórico): 104', detail)
 

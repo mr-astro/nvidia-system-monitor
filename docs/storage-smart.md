@@ -29,10 +29,12 @@ doble anillo no cambian.
 | `exit_status` | Código del proceso, solo para muestras smartctl |
 | `state` | Adquisición, finalización, edad máxima y error de consulta |
 
-La interfaz muestra fuente, edad y contadores en el tooltip. Los valores que han
-caducado o tienen error de consulta solo aparecen como lectura anterior. La
-medición principal se identifica como no disponible. Se conservan los avisos
-junto a lecturas vigentes: un contador CRC histórico no declara fallo de salud.
+La fase 3.2 agrupa salud, desgaste y horas en una sección compacta. Fuente, edad y
+caducidad son visibles; las advertencias se presentan por separado. Los valores
+que han caducado o tienen error de consulta quedan como N/D en las métricas y solo
+aparecen como lectura anterior en los detalles. Un contador CRC histórico no
+declara fallo de salud. Véase [presentación SMART](storage-smart-presentation.md)
+para estados, reflujo GTK4 y validación visual.
 
 ## Interfaces UDisks2
 
